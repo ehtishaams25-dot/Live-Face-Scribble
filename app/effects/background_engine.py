@@ -81,6 +81,14 @@ class BackgroundEngine:
         self._prev_hand_mask = None
         self._hand_miss_count = 0
 
+        # Primary-person isolation: keeps only the tracked subject (or explicitly
+        # included regions) in the foreground matte, so bystanders walking through
+        # frame are excluded by default. Opt-in click-to-include/exclude overrides.
+        self.person_isolation_enabled = False
+        self.forced_include_points = []   # list of (x_norm, y_norm)
+        self.forced_exclude_points = []   # list of (x_norm, y_norm)
+        self._primary_centroid_norm = None
+
         # Real-time Hand Gesture Landmark Detector for Zero-Drop Hand Fusion
         self.hand_landmarker = None
         hand_model_path = os.path.join(self.models_dir, "hand_landmarker.task")
@@ -306,6 +314,98 @@ class BackgroundEngine:
     def get_latest_hand_mask(self) -> np.ndarray:
         return getattr(self, '_latest_hand_mask', None)
 
+    # ------------------------------------------------------------------
+    # Primary-Person Isolation & Click-to-Include/Exclude
+    # ------------------------------------------------------------------
+    def set_person_isolation(self, enabled: bool):
+        self.person_isolation_enabled = bool(enabled)
+
+    def add_forced_point(self, x_norm: float, y_norm: float, mode: str = "include"):
+        """Registers a click-to-include or click-to-exclude spot (normalized 0-1 frame coords)."""
+        pt = (float(np.clip(x_norm, 0.0, 1.0)), float(np.clip(y_norm, 0.0, 1.0)))
+        target = self.forced_include_points if mode == "include" else self.forced_exclude_points
+        # Toggle off if clicking near an existing point of the same kind
+        for i, (ex, ey) in enumerate(target):
+            if (ex - pt[0]) ** 2 + (ey - pt[1]) ** 2 < 0.02 ** 2:
+                target.pop(i)
+                return
+        target.append(pt)
+
+    def clear_forced_points(self):
+        self.forced_include_points = []
+        self.forced_exclude_points = []
+        self._primary_centroid_norm = None
+
+    def _compute_isolation_keep_mask(self, alpha_small: np.ndarray, face_center_norm) -> np.ndarray:
+        """
+        alpha_small: float32 array in [0, 1] at low resolution.
+        Returns a float32 keep-mask (same shape) that is 1.0 for the primary
+        subject (and any forced-include blobs) and 0.0 elsewhere, feathered.
+        Falls back to an all-ones mask whenever there is nothing to isolate
+        (a single blob / no detections), so it never clips a normal solo frame.
+        """
+        h, w = alpha_small.shape
+        binary = (alpha_small > 0.5).astype(np.uint8)
+
+        # Merge near-touching fragments (e.g. a hand slightly detached from a
+        # sleeve due to matte noise) so they aren't misclassified as a separate person.
+        close_k = max(3, (min(h, w) // 20) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        if num_labels <= 2:
+            # Zero or one foreground blob — nothing to isolate, pass everything through.
+            if num_labels == 2:
+                self._primary_centroid_norm = (centroids[1][0] / w, centroids[1][1] / h)
+            return np.ones((h, w), dtype=np.float32)
+
+        min_area = max(6, int(0.0015 * w * h))
+        candidates = [i for i in range(1, num_labels) if stats[i, cv2.CC_STAT_AREA] >= min_area]
+        if not candidates:
+            return np.ones((h, w), dtype=np.float32)
+
+        def nearest_to(px, py):
+            best_i, best_d = None, None
+            for i in candidates:
+                cx, cy = centroids[i]
+                d = (cx - px) ** 2 + (cy - py) ** 2
+                if best_d is None or d < best_d:
+                    best_d, best_i = d, i
+            return best_i
+
+        primary_label = None
+        if face_center_norm is not None:
+            primary_label = nearest_to(face_center_norm[0] * w, face_center_norm[1] * h)
+        if primary_label is None and self._primary_centroid_norm is not None:
+            primary_label = nearest_to(self._primary_centroid_norm[0] * w, self._primary_centroid_norm[1] * h)
+        if primary_label is None:
+            primary_label = max(candidates, key=lambda i: stats[i, cv2.CC_STAT_AREA])
+
+        self._primary_centroid_norm = (centroids[primary_label][0] / w, centroids[primary_label][1] / h)
+
+        keep_labels = {primary_label}
+        include_radius = 0.15 * max(w, h)
+        for (ix, iy) in self.forced_include_points:
+            px, py = ix * w, iy * h
+            for i in candidates:
+                cx, cy = centroids[i]
+                if (cx - px) ** 2 + (cy - py) ** 2 < include_radius ** 2:
+                    keep_labels.add(i)
+
+        keep_mask = np.isin(labels, list(keep_labels)).astype(np.float32)
+
+        exclude_radius = 0.15 * max(w, h)
+        for (ex_n, ey_n) in self.forced_exclude_points:
+            px, py = ex_n * w, ey_n * h
+            yy, xx = np.ogrid[:h, :w]
+            dist2 = (xx - px) ** 2 + (yy - py) ** 2
+            keep_mask[dist2 < exclude_radius ** 2] = 0.0
+
+        # Feather the blob boundary so the cut doesn't look hard-edged.
+        keep_mask = cv2.GaussianBlur(keep_mask, (0, 0), sigmaX=max(1.0, min(h, w) * 0.01))
+        return keep_mask
+
     def process(self, frame_bgr: np.ndarray,
                 mode: str = "blur",
                 blur_strength: int = 45,
@@ -316,10 +416,8 @@ class BackgroundEngine:
                 downsample_ratio: float = None,
                 edge_choke: int = None,
                 enable_decontamination: bool = None,
-                hand_mask: np.ndarray = None) -> np.ndarray:
-        if mode == self.MODE_ORIGINAL:
-            return frame_bgr
-
+                hand_mask: np.ndarray = None,
+                face_center_norm=None) -> np.ndarray:
         h, w = frame_bgr.shape[:2]
 
         if timestamp_ms is None or timestamp_ms <= self.last_timestamp_ms:
@@ -328,14 +426,20 @@ class BackgroundEngine:
         else:
             self.last_timestamp_ms = timestamp_ms
 
+        # Always resolve the hand occlusion mask (even in MODE_ORIGINAL) so this
+        # is the single shared HandLandmarker instance for the whole pipeline —
+        # downstream consumers (e.g. the scribble engine) reuse it instead of
+        # running a second, redundant hand-detection model every frame.
+        if hand_mask is None:
+            hand_mask = self.detect_hand_mask(frame_bgr, timestamp_ms)
+
+        if mode == self.MODE_ORIGINAL:
+            return frame_bgr
+
         active_engine = engine_type if engine_type is not None else self.engine_type
         ds_ratio = downsample_ratio if downsample_ratio is not None else self.downsample_ratio
         choke = edge_choke if edge_choke is not None else self.edge_choke
         decontaminate = enable_decontamination if enable_decontamination is not None else self.enable_decontamination
-
-        # Automatically detect hands if not explicitly supplied
-        if hand_mask is None:
-            hand_mask = self.detect_hand_mask(frame_bgr, timestamp_ms)
 
         mask_u8 = None
         fg_frame = frame_bgr
@@ -380,6 +484,19 @@ class BackgroundEngine:
                     # Alpha solidity boost: guarantees hands, arms, and torso are 100% opaque without ghosting
                     pha = torch.where(pha > 0.35, torch.clamp((pha - 0.05) * 1.30, 0.0, 1.0), pha * 0.70)
                     pha = torch.clamp(pha, 0.0, 1.0)
+
+                    # Primary-person isolation: restrict the matte to the tracked subject
+                    # (plus any click-to-include blobs), excluding bystanders by default.
+                    if self.person_isolation_enabled:
+                        small_w = max(64, min(200, w // 4))
+                        small_h = max(36, int(small_w * h / w))
+                        pha_small = torch.nn.functional.interpolate(
+                            pha.float(), size=(small_h, small_w), mode='bilinear', align_corners=False
+                        )[0, 0].cpu().numpy()
+                        keep_small = self._compute_isolation_keep_mask(pha_small, face_center_norm)
+                        keep_full = cv2.resize(keep_small, (w, h), interpolation=cv2.INTER_LINEAR)
+                        keep_t = torch.from_numpy(keep_full).to(device="cuda", dtype=dtype_t).view(1, 1, h, w)
+                        pha = pha * keep_t
 
                     # Keep original camera colors inside the subject, only applying RVM decontamination at boundaries
                     if decontaminate:
@@ -512,6 +629,15 @@ class BackgroundEngine:
                 mask_u8 = np.maximum(mask_u8, hand_mask)
 
             fg_frame = frame_bgr
+
+        # Primary-person isolation for the CPU-side mattes (RVM-on-CPU / MediaPipe fallback)
+        if mask_u8 is not None and self.person_isolation_enabled:
+            small_w = max(64, min(200, w // 4))
+            small_h = max(36, int(small_w * h / w))
+            mask_small = cv2.resize(mask_u8, (small_w, small_h), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+            keep_small = self._compute_isolation_keep_mask(mask_small, face_center_norm)
+            keep_full = cv2.resize(keep_small, (w, h), interpolation=cv2.INTER_LINEAR)
+            mask_u8 = (mask_u8.astype(np.float32) * keep_full).astype(np.uint8)
 
         # ----------------------------------------------------
         # 3. GENERATE TARGET BACKGROUND PLATE

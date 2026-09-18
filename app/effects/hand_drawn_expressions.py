@@ -2,6 +2,8 @@ import time
 import cv2
 import numpy as np
 
+from app.tracking.temporal_smoother import OneEuroFilter
+
 
 class HandDrawnExpressionsRenderer:
     """
@@ -38,10 +40,17 @@ class HandDrawnExpressionsRenderer:
         self.boil_fps = float(boil_fps)
         self.dist_coeffs = np.zeros((4, 1), dtype=np.float64)
 
-        # Temporal smoothing for blendshapes (Fast 1-frame response time)
+        # Adaptive per-channel 1-Euro smoothing for blendshapes — consistent with the
+        # pose smoothing strategy in temporal_smoother.py, and unlike a flat exponential
+        # filter it stays snappy on fast expression changes while remaining stable at rest.
+        self._bs_filters = {}
         self.smooth_bs = {}
-        self.alpha = 0.85
- 
+
+        # Hysteresis state for discrete expression classification (shocked/angry/etc.):
+        # entering a state requires a higher threshold than staying in it, which kills
+        # the near-boundary flicker a single hard threshold would otherwise cause.
+        self._state_active = {}
+
         # Facial surface depth in 3D Head Space (on the cranial surface, NOT floating in front)
         self.z_surf = -7.6
 
@@ -51,6 +60,8 @@ class HandDrawnExpressionsRenderer:
 
     def reset(self):
         self.smooth_bs.clear()
+        self._bs_filters.clear()
+        self._state_active.clear()
 
     def set_tongue_style(self, style: str):
         if style in (self.TONGUE_STYLE_SPRITE, self.TONGUE_STYLE_ORGANIC, "red_chalk"):
@@ -61,16 +72,26 @@ class HandDrawnExpressionsRenderer:
                            self.TONGUE_SENSITIVITY_MED, self.TONGUE_SENSITIVITY_HIGH):
             self.tongue_sensitivity = sensitivity
 
-    def _get_smoothed_blendshapes(self, raw_bs: dict) -> dict:
-        if not self.smooth_bs:
-            self.smooth_bs = {k: float(v) for k, v in raw_bs.items()}
-            return self.smooth_bs
-
+    def _get_smoothed_blendshapes(self, raw_bs: dict, t: float) -> dict:
         for k, v in raw_bs.items():
-            prev = self.smooth_bs.get(k, float(v))
-            self.smooth_bs[k] = prev * (1.0 - self.alpha) + float(v) * self.alpha
+            f = self._bs_filters.get(k)
+            if f is None:
+                # min_cutoff=2.0 keeps low-speed jitter down without adding perceptible
+                # lag; beta=0.4 lets the filter open up fast for quick speech/blink
+                # transients instead of smearing them like a flat-alpha filter would.
+                f = OneEuroFilter(min_cutoff=2.0, beta=0.4, d_cutoff=1.0)
+                self._bs_filters[k] = f
+            self.smooth_bs[k] = float(f.filter(v, t))
 
         return self.smooth_bs
+
+    def _hyst(self, key: str, value: float, enter_thresh: float, exit_thresh: float) -> bool:
+        """Schmitt-trigger style hysteresis: a higher bar to enter a state than to stay in it."""
+        was_active = self._state_active.get(key, False)
+        thresh = exit_thresh if was_active else enter_thresh
+        is_active = value > thresh
+        self._state_active[key] = is_active
+        return is_active
 
     def _make_scribble_knot_eye(self, ex: float, ey: float, z_surf: float,
                                 radius: float = 1.35, gaze_x: float = 0.0, gaze_y: float = 0.0,
@@ -181,64 +202,41 @@ class HandDrawnExpressionsRenderer:
 
         return curves
 
-    def _make_eyebrows(self, is_angry: bool, is_worried: bool, is_scared: bool,
-                       is_confused: bool, is_skeptical: bool, brow_down: float,
-                       brow_up: float, z_surf: float, rng: np.random.RandomState = None) -> list:
+    def _make_eyebrows(self, brow_up: float, brow_down_l: float, brow_down_r: float,
+                       brow_outer_up_l: float, brow_outer_up_r: float,
+                       z_surf: float, rng: np.random.RandomState = None) -> list:
         """
-        Eyebrows are strictly CONDITIONAL:
-        - Neutral, Happy, Laughing, Surprised, Sleepy, Calm: NO EYEBROWS AT ALL!
-        - Angry: Inward-downward angled fierce scribble brows (\\ /).
-        - Worried / Scared: Upward slanted inner brows (/ \\).
-        - Confused / Skeptical: One raised arched eyebrow over one eye.
+        Continuous eyebrow rendering driven directly by blendshape magnitude, always
+        present rather than gated to a handful of discrete extreme emotion states —
+        a real face's brows move constantly during ordinary speech. Height, tilt, and
+        stroke weight are continuous functions of brow_up/brow_down/outer_up per side,
+        so motion (including natural left/right asymmetry, e.g. a skeptical raised
+        brow) crossfades smoothly instead of snapping between fixed presets.
         """
-        # Strictly no eyebrows unless one of the specific emotional conditions is met
-        if not (is_angry or is_worried or is_scared or is_confused or is_skeptical):
-            return []
-
         curves = []
-        for sign in [1.0, -1.0]:
+        for sign, brow_down, outer_up in [(1.0, brow_down_l, brow_outer_up_l), (-1.0, brow_down_r, brow_outer_up_r)]:
             bx_center = sign * 3.3
             by = -5.4
             brow_w = 1.9
 
-            if is_angry:
-                # Angry inward-downward slash (\ /)
-                base_y = by + brow_down * 1.1
-                guide = []
-                for t in np.linspace(-1.0, 1.0, 10):
-                    x = bx_center + t * brow_w
-                    y = base_y - 0.20 * (1.0 - t**2) - (1.15 * t * sign)
-                    guide.append([x, y, z_surf])
-                guide_arr = np.array(guide, dtype=np.float64)
-                for s in range(2):
-                    offset_y = (s - 0.5) * 0.25
-                    curves.append(np.array([[p[0], p[1] + offset_y, p[2]] for p in guide_arr], dtype=np.float64))
+            lift = brow_up * 1.3 + outer_up * 0.9   # raises the brow (surprise / worry / confusion)
+            drop = brow_down * 1.1                   # lowers & furrows the brow (anger)
+            base_y = by - lift + drop
+            # Furrowing angles the inner end down (\ /); raising angles it up (/ \).
+            tilt = (drop - lift) * 0.55
 
-            elif is_worried or is_scared:
-                # Worried / Scared upward slanted inner brows (/ \)
-                base_y = by - brow_up * 1.2
-                guide = []
-                for t in np.linspace(-1.0, 1.0, 10):
-                    x = bx_center + t * brow_w
-                    y = base_y - 0.25 * (1.0 - t**2) + (0.95 * t * sign)
-                    guide.append([x, y, z_surf])
-                guide_arr = np.array(guide, dtype=np.float64)
-                for s in range(2):
-                    offset_y = (s - 0.5) * 0.25
-                    curves.append(np.array([[p[0], p[1] + offset_y, p[2]] for p in guide_arr], dtype=np.float64))
+            activity = float(np.clip(lift + drop, 0.0, 1.5))
+            n_strokes = 2 if activity > 0.12 else 1
 
-            elif (is_confused or is_skeptical) and sign > 0:
-                # One raised arched eyebrow over the right eye only
-                base_y = by - 1.25
-                guide = []
-                for t in np.linspace(-1.0, 1.0, 10):
-                    x = bx_center + t * brow_w
-                    y = base_y - 0.65 * (1.0 - t**2)
-                    guide.append([x, y, z_surf])
-                guide_arr = np.array(guide, dtype=np.float64)
-                for s in range(2):
-                    offset_y = (s - 0.5) * 0.25
-                    curves.append(np.array([[p[0], p[1] + offset_y, p[2]] for p in guide_arr], dtype=np.float64))
+            guide = []
+            for t in np.linspace(-1.0, 1.0, 10):
+                x = bx_center + t * brow_w
+                y = base_y - 0.20 * (1.0 - t**2) - (tilt * t * sign)
+                guide.append([x, y, z_surf])
+            guide_arr = np.array(guide, dtype=np.float64)
+            for s in range(n_strokes):
+                offset_y = (s - (n_strokes - 1) / 2.0) * 0.22
+                curves.append(np.array([[p[0], p[1] + offset_y, p[2]] for p in guide_arr], dtype=np.float64))
 
         return curves
 
@@ -419,6 +417,20 @@ class HandDrawnExpressionsRenderer:
 
         return curves, tongue_curves
 
+    def _draw_curves_batched(self, curves, rvec, tvec, cam_mat, color, thickness, target_img):
+        """Projects and draws a list of variable-length 3D curves with one
+        cv2.projectPoints + one cv2.polylines call instead of per-curve calls."""
+        valid = [c for c in curves if len(c) >= 2]
+        if not valid:
+            return
+        lens = [len(c) for c in valid]
+        splits = np.cumsum(lens)[:-1]
+        all_pts = np.vstack(valid)
+        proj, _ = cv2.projectPoints(all_pts, rvec, tvec, cam_mat, self.dist_coeffs)
+        pts_2d = proj.reshape(-1, 2)
+        polylines = [p.astype(np.int32).reshape(-1, 1, 2) for p in np.split(pts_2d, splits)]
+        cv2.polylines(target_img, polylines, False, color, thickness, cv2.LINE_AA)
+
     def render(self, frame_bgr: np.ndarray, tracking_data: dict,
                style: str = "white", t_sec: float = None,
                line_thickness: int = 3) -> np.ndarray:
@@ -440,7 +452,7 @@ class HandDrawnExpressionsRenderer:
         step_id = int(cur_t * self.boil_fps)
         rng = np.random.RandomState(step_id & 0x7FFFFFFF)
 
-        bs = self._get_smoothed_blendshapes(raw_bs)
+        bs = self._get_smoothed_blendshapes(raw_bs, cur_t)
 
         # Facing direction check (yaw fade)
         R_head, _ = cv2.Rodrigues(rvec)
@@ -483,22 +495,42 @@ class HandDrawnExpressionsRenderer:
         squint_l = bs.get('eyeSquintLeft', 0.0)
         squint_r = bs.get('eyeSquintRight', 0.0)
         brow_up = bs.get('browInnerUp', 0.0)
-        brow_down = max(bs.get('browDownLeft', 0.0), bs.get('browDownRight', 0.0))
+        brow_down_l = bs.get('browDownLeft', 0.0)
+        brow_down_r = bs.get('browDownRight', 0.0)
+        brow_down = max(brow_down_l, brow_down_r)
+        brow_outer_up_l = bs.get('browOuterUpLeft', 0.0)
+        brow_outer_up_r = bs.get('browOuterUpRight', 0.0)
 
         # Eye gaze tracking
         look_x = (bs.get('eyeLookOutRight', 0.0) - bs.get('eyeLookInRight', 0.0) +
                   bs.get('eyeLookInLeft', 0.0) - bs.get('eyeLookOutLeft', 0.0)) * 0.40
         look_y = (bs.get('eyeLookDownLeft', 0.0) - bs.get('eyeLookUpLeft', 0.0)) * 0.30
 
-        # Expression classification
-        is_shocked = (jaw > 0.38 and brow_up > 0.30 and smile < 0.25)
-        is_angry = (brow_down > 0.38 and smile < 0.20 and not is_shocked)
-        is_worried = (brow_up > 0.35 and frown > 0.20 and not is_shocked and not is_angry)
-        is_scared = (brow_up > 0.40 and jaw > 0.25 and not is_shocked)
-        is_laughing = (smile > 0.35 and jaw > 0.18)
-        is_confused = (abs(bs.get('browOuterUpLeft', 0.0) - bs.get('browOuterUpRight', 0.0)) > 0.25)
+        # Expression classification. Each state's primary driving signal is gated
+        # through hysteresis (a higher bar to enter than to stay), which prevents
+        # the visible discrete "pose snapping" that a single hard threshold causes
+        # when a blendshape hovers right at the boundary.
+        jaw_shock = self._hyst('jaw_shock', jaw, 0.38, 0.30)
+        is_shocked = (jaw_shock and brow_up > 0.30 and smile < 0.25)
+
+        brow_down_angry = self._hyst('brow_down_angry', brow_down, 0.38, 0.30)
+        is_angry = (brow_down_angry and smile < 0.20 and not is_shocked)
+
+        frown_worried = self._hyst('frown_worried', frown, 0.20, 0.14)
+        is_worried = (brow_up > 0.35 and frown_worried and not is_shocked and not is_angry)
+
+        jaw_scared = self._hyst('jaw_scared', jaw, 0.25, 0.18)
+        is_scared = (brow_up > 0.40 and jaw_scared and not is_shocked)
+
+        smile_laugh = self._hyst('smile_laugh', smile, 0.35, 0.28)
+        is_laughing = (smile_laugh and jaw > 0.18)
+
+        brow_asym = abs(brow_outer_up_l - brow_outer_up_r)
+        is_confused = self._hyst('confused', brow_asym, 0.25, 0.18)
         is_skeptical = is_confused
-        is_sleepy = (max(blink_l, blink_r) > 0.35 and jaw < 0.15 and smile < 0.15)
+
+        blink_sleepy = self._hyst('blink_sleepy', max(blink_l, blink_r), 0.35, 0.27)
+        is_sleepy = (blink_sleepy and jaw < 0.15 and smile < 0.15)
 
         # STRICT TONGUE ACTIVATION GATE (IMMUNITY DURING SPEECH)
         show_tongue = False
@@ -584,11 +616,11 @@ class HandDrawnExpressionsRenderer:
             )
             curves_3d.extend(eye_curves)
 
-        # 2. Eyebrows (Conditional: ONLY when angry, worried, or confused/skeptical)
+        # 2. Eyebrows (continuous: always present, driven by live blendshape magnitude)
         brow_curves = self._make_eyebrows(
-            is_angry=is_angry, is_worried=is_worried, is_scared=is_scared,
-            is_confused=is_confused, is_skeptical=is_skeptical,
-            brow_down=brow_down, brow_up=brow_up, z_surf=z_surf, rng=rng
+            brow_up=brow_up, brow_down_l=brow_down_l, brow_down_r=brow_down_r,
+            brow_outer_up_l=brow_outer_up_l, brow_outer_up_r=brow_outer_up_r,
+            z_surf=z_surf, rng=rng
         )
         curves_3d.extend(brow_curves)
 
@@ -603,16 +635,14 @@ class HandDrawnExpressionsRenderer:
         )
         curves_3d.extend(mouth_curves)
 
-        # Project and draw all facial sketch strokes
+        # Project and draw all facial sketch strokes — batched into a single
+        # projectPoints + polylines call each (matching the vectorized pattern
+        # used by scribble_sphere_3d.py) instead of one Python-level call pair
+        # per curve, which is real per-frame overhead given ~40-60 small curves.
         stroke_color = self.COLOR_BLACK if style == "white" else self.COLOR_WHITE
         target_img = frame_bgr if alpha >= 0.98 else frame_bgr.copy()
 
-        for c in curves_3d:
-            if len(c) < 2:
-                continue
-            proj, _ = cv2.projectPoints(c, rvec, tvec, cam_mat, self.dist_coeffs)
-            pts_2d = proj.reshape(-1, 2).astype(np.int32)
-            cv2.polylines(target_img, [pts_2d], False, stroke_color, line_thickness, cv2.LINE_AA)
+        self._draw_curves_batched(curves_3d, rvec, tvec, cam_mat, stroke_color, line_thickness, target_img)
 
         # Project and draw tongue strokes with selected tongue style
         if show_tongue and tongue_curves:
@@ -622,13 +652,7 @@ class HandDrawnExpressionsRenderer:
             else:
                 # Version 1: Reference image style (white chalk hatchings matching helmet style)
                 tongue_stroke_col = stroke_color
-
-            for tc in tongue_curves:
-                if len(tc) < 2:
-                    continue
-                proj, _ = cv2.projectPoints(tc, rvec, tvec, cam_mat, self.dist_coeffs)
-                pts_2d = proj.reshape(-1, 2).astype(np.int32)
-                cv2.polylines(target_img, [pts_2d], False, tongue_stroke_col, max(1, line_thickness - 1), cv2.LINE_AA)
+            self._draw_curves_batched(tongue_curves, rvec, tvec, cam_mat, tongue_stroke_col, max(1, line_thickness - 1), target_img)
 
         if alpha < 0.98:
             cv2.addWeighted(target_img, alpha, frame_bgr, 1.0 - alpha, 0, dst=frame_bgr)

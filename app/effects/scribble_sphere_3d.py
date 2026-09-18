@@ -354,28 +354,48 @@ class ScribbleSphere3DEngine:
         pts_2d_all = proj_all.reshape(-1, 2)
         proj_curves = np.split(pts_2d_all, self.splits)
 
-        # 3. 3D Depth Sorting
-        scaled_centers = (self.curve_centers * self.scale_factor) + self.offset
-        centers_cam = (R @ scaled_centers.T).T + tvec.T
-        z_centers = centers_cam[:, 2]
+        # 3. Per-Vertex 3D Depth Classification (NOT per-curve-centroid).
+        # A curve that spans the front/back boundary (e.g. a meridian arc running
+        # from the face-front to the occiput near the temples at partial yaw) is
+        # split exactly where it crosses the depth threshold, instead of being
+        # bucketed as a whole to one side — this is what fixes the visible
+        # clipping/seam artifact when turning the head, since previously the
+        # entire curve would pop between front/back based on a single centroid Z.
+        pts_cam_z = (R @ cur_pts_3d.T)[2, :] + float(tvec[2, 0])
+        z_per_curve = np.split(pts_cam_z, self.splits)
 
         active_count = min(self.density, len(proj_curves))
         base_thick = max(1, int(active_thickness))
+        thresh = center_z + 0.5
 
-        # 4. Separate into Back vs Front Polylines
+        # 4. Separate into Back vs Front Polylines, splitting mixed curves at the
+        # exact vertex where they cross the depth threshold.
         back_polylines = []
         front_polylines = []
 
-        for c2d, z_c in zip(proj_curves[:active_count], z_centers[:active_count]):
+        for c2d, z_pts in zip(proj_curves[:active_count], z_per_curve[:active_count]):
             # Fast bounding check
             if not ((c2d[:, 0].max() >= 0) and (c2d[:, 0].min() <= w) and
                     (c2d[:, 1].max() >= 0) and (c2d[:, 1].min() <= h)):
                 continue
-            p_int = c2d.reshape(-1, 1, 2).astype(np.int32)
-            if z_c > center_z + 0.5:
-                back_polylines.append(p_int)
-            else:
-                front_polylines.append(p_int)
+
+            is_back = z_pts > thresh
+            if is_back.all():
+                back_polylines.append(c2d.reshape(-1, 1, 2).astype(np.int32))
+                continue
+            if not is_back.any():
+                front_polylines.append(c2d.reshape(-1, 1, 2).astype(np.int32))
+                continue
+
+            # Mixed curve: split into contiguous front/back runs at the crossing point.
+            change_idx = np.where(np.diff(is_back.astype(np.int8)) != 0)[0] + 1
+            run_pts = np.split(c2d, change_idx)
+            run_back = np.split(is_back, change_idx)
+            for rp, rb in zip(run_pts, run_back):
+                if len(rp) < 2:
+                    continue
+                target = back_polylines if rb[0] else front_polylines
+                target.append(rp.reshape(-1, 1, 2).astype(np.int32))
 
         # 5. Color Palette
         if custom_color is not None:

@@ -3,6 +3,7 @@ import sys
 import time
 import cv2
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap, QFont, QIcon, QColor, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -28,6 +29,21 @@ from app.apple_widgets import (
 )
 
 
+class ClickableVideoLabel(QLabel):
+    """
+    Video canvas that reports click position (widget-local pixels) for the
+    person-isolation feature: left-click marks a spot to keep in frame,
+    right-click marks a spot to exclude from the background matte.
+    """
+    clicked = Signal(int, int, bool)  # x, y, is_right_click
+
+    def mousePressEvent(self, event):
+        if event.button() in (Qt.LeftButton, Qt.RightButton):
+            pos = event.position() if hasattr(event, 'position') else event.pos()
+            self.clicked.emit(int(pos.x()), int(pos.y()), event.button() == Qt.RightButton)
+        super().mousePressEvent(event)
+
+
 class PipelineWorker(QThread):
     """
     Background worker thread running 3D tracking, effects, compositing,
@@ -51,7 +67,15 @@ class PipelineWorker(QThread):
         self.virtual_cam = virtual_cam
 
         self.running = True
-        
+
+        # Two-stage parallel pipeline: tracking (CPU/MediaPipe) and background
+        # matting (GPU/RVM or CPU/MediaPipe) are independent per-frame computations
+        # (neither depends on the other's output), so running them concurrently on
+        # separate threads collapses total latency from track_ms+bg_ms down to
+        # roughly max(track_ms, bg_ms) instead of their sum.
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="PipelineIO")
+        self._last_face_center_norm = None
+
         # 3D Head Space Scribble Helmet settings
         self.enable_scribble = True
         self.enable_expressions = True
@@ -126,31 +150,24 @@ class PipelineWorker(QThread):
             ts_ms = int(time.time() * 1000)
 
             try:
-                # 1. 3D Head Space Tracking
+                # 1. + 2. Run 3D Head Tracking and Background Matting CONCURRENTLY.
+                # Neither stage reads the other's output for this frame (person-isolation
+                # seeding uses last frame's face center, one frame of staleness that is
+                # imperceptible given normal head motion), so overlapping them on two
+                # threads collapses latency to ~max(track_ms, bg_ms) instead of the sum.
                 t_track0 = time.time()
+                future_bg = self._executor.submit(self._process_background, frame, ts_ms)
                 track_res = self.tracker.process_frame(frame, timestamp_ms=ts_ms)
                 track_ms = (time.time() - t_track0) * 1000.0
 
-                # 2. Background Segmentation & Relighting
-                t_bg0 = time.time()
-                self.bg_engine.use_guided_filter = self.use_guided_filter
-                self.bg_engine.set_relighting_params(
-                    enabled=self.enable_relighting,
-                    rim_intensity=self.rim_intensity,
-                    ambient_intensity=self.ambient_intensity
-                )
-                composited = self.bg_engine.process(
-                    frame_bgr=frame,
-                    mode=self.bg_mode,
-                    blur_strength=self.blur_strength,
-                    timestamp_ms=ts_ms,
-                    engine_type=self.matting_engine,
-                    downsample_ratio=self.downsample_ratio,
-                    edge_choke=self.edge_choke,
-                    enable_decontamination=self.enable_decontamination
-                )
-                bg_ms = (time.time() - t_bg0) * 1000.0
-                hand_mask = self.bg_engine.get_latest_hand_mask()
+                composited, hand_mask, bg_ms = future_bg.result()
+
+                if track_res.get('has_face', False):
+                    h_f, w_f = frame.shape[:2]
+                    self._last_face_center_norm = (
+                        track_res['center_x'] / max(1, w_f),
+                        track_res['center_y'] / max(1, h_f)
+                    )
 
                 # 3. 3D Anatomical Scribble Helmet with Hand Occlusion Awareness
                 t_sc0 = time.time()
@@ -222,9 +239,38 @@ class PipelineWorker(QThread):
             except Exception as e:
                 print(f"[PipelineWorker] Error processing frame: {e}")
 
+    def _process_background(self, frame, ts_ms):
+        """
+        Runs on the executor thread pool, in parallel with tracking. Performs
+        background matting/replacement and returns the composited frame plus the
+        latest hand occlusion mask, for the caller to fuse with tracking results.
+        """
+        t_bg0 = time.time()
+        self.bg_engine.use_guided_filter = self.use_guided_filter
+        self.bg_engine.set_relighting_params(
+            enabled=self.enable_relighting,
+            rim_intensity=self.rim_intensity,
+            ambient_intensity=self.ambient_intensity
+        )
+        composited = self.bg_engine.process(
+            frame_bgr=frame,
+            mode=self.bg_mode,
+            blur_strength=self.blur_strength,
+            timestamp_ms=ts_ms,
+            engine_type=self.matting_engine,
+            downsample_ratio=self.downsample_ratio,
+            edge_choke=self.edge_choke,
+            enable_decontamination=self.enable_decontamination,
+            face_center_norm=self._last_face_center_norm
+        )
+        bg_ms = (time.time() - t_bg0) * 1000.0
+        hand_mask = self.bg_engine.get_latest_hand_mask()
+        return composited, hand_mask, bg_ms
+
     def stop(self):
         self.running = False
         self.wait(1000)
+        self._executor.shutdown(wait=False)
 
 
 class ScribbleCameraWindow(QMainWindow):
@@ -294,10 +340,12 @@ class ScribbleCameraWindow(QMainWindow):
         viewport_layout.setSpacing(10)
 
         # Video canvas
-        self.video_label = QLabel()
+        self.video_label = ClickableVideoLabel()
         self.video_label.setObjectName("videoCanvas")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.video_label.clicked.connect(self._on_video_clicked)
+        self._last_frame_wh = None
         viewport_layout.addWidget(self.video_label, stretch=1)
 
         # Floating Action Dock
@@ -556,6 +604,28 @@ class ScribbleCameraWindow(QMainWindow):
         card_bg.add_widget(self.btn_pick_img)
         page_stage_layout.addWidget(card_bg)
 
+        # Card: Primary-Person Isolation (click-to-include/exclude bystanders)
+        card_isolation = AppleCard("Person Isolation", theme=self.current_theme)
+        self.all_apple_widgets.append(card_isolation)
+
+        self.chk_isolation = AppleSwitch(checked=False, theme=self.current_theme)
+        self.chk_isolation.toggled.connect(self._on_isolation_toggled)
+        self.all_apple_widgets.append(self.chk_isolation)
+        row_isolation = AppleRow("Isolate Primary Person", self.chk_isolation, "Keeps only you in frame; excludes anyone who walks through", theme=self.current_theme)
+        self.all_apple_widgets.append(row_isolation)
+        card_isolation.add_widget(row_isolation)
+
+        self.lbl_isolation_help = QLabel("Left-click the video to keep a spot in frame. Right-click to remove a spot. Click a marked spot again to undo it.")
+        self.lbl_isolation_help.setWordWrap(True)
+        self.lbl_isolation_help.setStyleSheet("font-size: 11px; line-height: 1.4;")
+        card_isolation.add_widget(self.lbl_isolation_help)
+
+        self.btn_clear_isolation = ApplePillButton("Clear Selections", theme=self.current_theme)
+        self.btn_clear_isolation.clicked.connect(self._on_clear_isolation)
+        self.all_apple_widgets.append(self.btn_clear_isolation)
+        card_isolation.add_widget(self.btn_clear_isolation)
+        page_stage_layout.addWidget(card_isolation)
+
         # Card: Spatial Relighting
         card_relight = AppleCard("Spatial Relighting & Light Wrap", theme=self.current_theme)
         self.all_apple_widgets.append(card_relight)
@@ -643,8 +713,8 @@ class ScribbleCameraWindow(QMainWindow):
         card_input.add_widget(row_cam)
 
         self.res_combo = QComboBox()
+        self.res_combo.addItem("720p HD (1280x720) — Recommended", (1280, 720))
         self.res_combo.addItem("1080p Full HD (1920x1080)", (1920, 1080))
-        self.res_combo.addItem("720p HD (1280x720)", (1280, 720))
         self.res_combo.currentIndexChanged.connect(self._on_resolution_changed)
         row_res = AppleRow("Resolution", self.res_combo, theme=self.current_theme)
         self.all_apple_widgets.append(row_res)
@@ -994,6 +1064,7 @@ class ScribbleCameraWindow(QMainWindow):
     def _on_frame_processed(self, frame_bgr: np.ndarray, metrics: dict):
         h, w, ch = frame_bgr.shape
         bytes_per_line = ch * w
+        self._last_frame_wh = (w, h)
 
         if self.show_hud:
             frame_display = self._draw_apple_hud(frame_bgr, metrics, w, h)
@@ -1109,6 +1180,16 @@ class ScribbleCameraWindow(QMainWindow):
                 cv2.putText(out, "LIVE", (rx1 + 20, ry1 + 20),
                             cv2.FONT_HERSHEY_DUPLEX, 0.44, (255, 180, 50), 1, cv2.LINE_AA)
 
+        # 4. Person Isolation click markers (green = keep, red = exclude)
+        if getattr(self.bg_engine, 'person_isolation_enabled', False):
+            for (nx, ny) in self.bg_engine.forced_include_points:
+                cv2.circle(out, (int(nx * w), int(ny * h)), 14, (60, 220, 90), 2, cv2.LINE_AA)
+            for (nx, ny) in self.bg_engine.forced_exclude_points:
+                cx, cy = int(nx * w), int(ny * h)
+                cv2.circle(out, (cx, cy), 14, (50, 50, 235), 2, cv2.LINE_AA)
+                cv2.line(out, (cx - 9, cy - 9), (cx + 9, cy + 9), (50, 50, 235), 2, cv2.LINE_AA)
+                cv2.line(out, (cx - 9, cy + 9), (cx + 9, cy - 9), (50, 50, 235), 2, cv2.LINE_AA)
+
         return out
 
     # =========================================================================
@@ -1214,6 +1295,35 @@ class ScribbleCameraWindow(QMainWindow):
     def _on_ambient_changed(self, val):
         if self.pipeline_worker:
             self.pipeline_worker.ambient_intensity = val / 100.0
+
+    def _on_isolation_toggled(self, checked):
+        self.bg_engine.set_person_isolation(checked)
+
+    def _on_clear_isolation(self):
+        self.bg_engine.clear_forced_points()
+
+    def _on_video_clicked(self, x: int, y: int, is_right: bool):
+        if not self._last_frame_wh:
+            return
+        frame_w, frame_h = self._last_frame_wh
+        label_w = self.video_label.width()
+        label_h = self.video_label.height()
+        if label_w <= 0 or label_h <= 0:
+            return
+
+        # Map widget-local click pixels back to normalized frame coords, accounting
+        # for the aspect-fit letterboxing Qt.KeepAspectRatio introduces.
+        scale = min(label_w / frame_w, label_h / frame_h)
+        disp_w, disp_h = frame_w * scale, frame_h * scale
+        off_x = (label_w - disp_w) / 2.0
+        off_y = (label_h - disp_h) / 2.0
+        if not (off_x <= x <= off_x + disp_w and off_y <= y <= off_y + disp_h):
+            return
+
+        x_norm = (x - off_x) / disp_w
+        y_norm = (y - off_y) / disp_h
+        mode = "exclude" if is_right else "include"
+        self.bg_engine.add_forced_point(x_norm, y_norm, mode=mode)
 
     def _on_guided_toggled(self, checked):
         if self.pipeline_worker:
