@@ -478,8 +478,12 @@ class BackgroundEngine:
                         hand_t = torch.from_numpy(hand_mask).to(device="cuda", dtype=dtype_t).div_(255.0).view(1, 1, h, w)
                         # Hand is guaranteed 100% opaque without cutoff or see-through
                         pha = torch.maximum(pha, (hand_t * 1.30).clamp(0.0, 1.0))
-                        # Suppress recurrent ghosting lag during rapid gestures
-                        self.rvm_rec = [r * 0.70 if r is not None else None for r in self.rvm_rec]
+                        # Lightly refresh recurrent state to fight ghosting during rapid
+                        # gestures. The hand's own pixels are already guaranteed solid by
+                        # the maximum() above, so this only needs to nudge the surrounding
+                        # motion wake — a mild 0.85 decay (vs. the previous 0.70) keeps far
+                        # more of RVM's temporal consistency instead of discarding it.
+                        self.rvm_rec = [r * 0.85 if r is not None else None for r in self.rvm_rec]
 
                     # Alpha solidity boost: guarantees hands, arms, and torso are 100% opaque without ghosting
                     pha = torch.where(pha > 0.35, torch.clamp((pha - 0.05) * 1.30, 0.0, 1.0), pha * 0.70)

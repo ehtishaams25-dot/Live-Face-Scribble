@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, Slot
-from PySide6.QtGui import QImage, QPixmap, QFont, QIcon, QColor, QPainter, QPen
+from PySide6.QtGui import QImage, QPixmap, QFont, QIcon, QColor, QPainter, QPen, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QSlider, QCheckBox, QGroupBox,
@@ -321,8 +321,15 @@ class ScribbleCameraWindow(QMainWindow):
         self.rec_timer.timeout.connect(self._update_record_timer)
 
         self._setup_ui()
+        self._setup_shortcuts()
         self.set_theme("dark")
         self._start_pipeline(source=0)
+
+    def _setup_shortcuts(self):
+        """Quick keyboard access for the actions used most while recording/streaming."""
+        QShortcut(QKeySequence(Qt.Key_Space), self, activated=self._toggle_record)
+        QShortcut(QKeySequence("V"), self, activated=self._toggle_virtual_cam)
+        QShortcut(QKeySequence("H"), self, activated=self._toggle_hud_dock)
 
     def _setup_ui(self):
         main_widget = QWidget()
@@ -725,6 +732,21 @@ class ScribbleCameraWindow(QMainWindow):
         self.all_apple_widgets.append(self.btn_refresh_cam)
         card_input.add_widget(self.btn_refresh_cam)
         page_studio_layout.addWidget(card_input)
+
+        # Card: Performance
+        card_perf = AppleCard("Performance", theme=self.current_theme)
+        self.all_apple_widgets.append(card_perf)
+
+        self.lbl_perf_info = QLabel("One-tap preset for lower-end machines: 720p capture, the fastest matting engine, and relighting/hair-detail off — so more of your CPU/GPU stays free for recording and editing software.")
+        self.lbl_perf_info.setWordWrap(True)
+        self.lbl_perf_info.setStyleSheet("font-size: 11px; line-height: 1.4;")
+        card_perf.add_widget(self.lbl_perf_info)
+
+        self.btn_low_end_preset = ApplePillButton("Apply Low-End PC Preset", is_accent=True, theme=self.current_theme)
+        self.btn_low_end_preset.clicked.connect(self._apply_low_end_preset)
+        self.all_apple_widgets.append(self.btn_low_end_preset)
+        card_perf.add_widget(self.btn_low_end_preset)
+        page_studio_layout.addWidget(card_perf)
 
         # Card: Display & Telemetry
         card_display = AppleCard("Display & Telemetry", theme=self.current_theme)
@@ -1295,6 +1317,23 @@ class ScribbleCameraWindow(QMainWindow):
     def _on_ambient_changed(self, val):
         if self.pipeline_worker:
             self.pipeline_worker.ambient_intensity = val / 100.0
+
+    def _apply_low_end_preset(self):
+        """One-tap bundle of settings tuned for lower-end machines: smaller capture
+        resolution, the fastest matting engine, and disabling the extra per-frame
+        cost of relighting/guided-filter hair refinement."""
+        self.res_combo.setCurrentIndex(0)  # 720p
+        mobile_idx = 0 if getattr(self.bg_engine, 'has_cuda', False) else 2  # RVM MobileNet or MediaPipe
+        self.matting_engine_combo.setCurrentIndex(mobile_idx)
+        self.slider_precision.setValue(30)
+        self.chk_relight.setChecked(False)
+        self.chk_guided.setChecked(False)
+        QMessageBox.information(
+            self, "Low-End PC Preset Applied",
+            "720p capture, the fastest matting engine, and relighting/hair-detail "
+            "refinement are now off — this frees up CPU/GPU headroom for your "
+            "recording and video-editing software."
+        )
 
     def _on_isolation_toggled(self, checked):
         self.bg_engine.set_person_isolation(checked)
