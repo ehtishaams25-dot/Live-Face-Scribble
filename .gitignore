@@ -5,3 +5,5 @@ recordings/
 scratch/
 *.glb
 *.zip
+*.pth
+*.mp4
