@@ -1,35 +1,53 @@
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import cv2
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-from app.effects.environment_engine import EnvironmentRelightingEngine
 
-try:
-    import torch
-    HAS_TORCH = True
-except ImportError:
-    torch = None
-    HAS_TORCH = False
+from app.effects.environment_engine import EnvironmentRelightingEngine
+from app.effects.person_isolation import PersonIsolator
+from app.effects.rvm_runner import RVMRunner, HAS_TORCH, torch, F
+from app.tracking.hand_tracker import HandTracker
+
+
+class BgResult:
+    """Output of one background pass."""
+    __slots__ = ("composite", "alpha_small", "alpha_full", "bg_ms", "engine", "people")
+
+    def __init__(self, composite, alpha_small=None, alpha_full=None, bg_ms=0.0, engine="none", people=None):
+        self.composite = composite
+        self.alpha_small = alpha_small
+        self.alpha_full = alpha_full
+        self.bg_ms = bg_ms
+        self.engine = engine
+        self.people = people or []
 
 
 class BackgroundEngine:
     """
-    Real-time background segmentation, edge refinement, neural video matting,
-    and environment compositing engine.
-    
-    Features:
-    - High-Precision Neural Video Matting (Robust Video Matting - RVM) with ResNet50 & MobileNetV3
-    - FP16 Tensor Core CUDA acceleration for 50+ FPS real-time human matting
-    - Recurrent hidden memory states (r1..r4) to guarantee zero temporal edge jitter
-    - Foreground color decontamination (fgr) to strip background reflections and green halo bleed
-    - Customizable edge choke (-3px to +3px) to guarantee razor-sharp boundary containment
-    - Proxy Guided Filter (cv2.ximgproc) for sub-4ms edge refinement
-    - Fallback to MediaPipe SelfieSegmenter for lightweight CPU execution
-    - EnvironmentRelightingEngine integration (ambient tinting, light wrap rim lighting, atmospheric spill)
-    - Vectorized SIMD C++ blending for rock-solid performance
+    Real-time person matting + background replacement.
+
+    Engines
+      * RVM ResNet50 / MobileNetV3 on CUDA (fp16, CUDA Graphs) — best quality, 6-11 ms.
+      * RVM on CPU (slow; only if there is no GPU and you insist).
+      * MediaPipe Selfie Segmenter on CPU — fastest on low-end machines; temporally
+        smoothed and edge-refined with a guided filter.
+
+    Two-phase API so the GPU works while the CPU tracks the face:
+        handle = engine.begin(frame, ts)          # queues GPU work, returns immediately
+        ... face / hand tracking on the CPU ...
+        result = engine.finish(handle, frame, hands=..., head_bbox=...)
+
+    Features: hand prior (fast hands stay solid; background between fingers stays clear),
+    matte hardness & choke, per-person isolation (click to hide/show people, Only-Me mode,
+    keep zones), and a learned clean background plate so hidden bystanders are erased
+    even in Original mode.
     """
+
     ENGINE_RVM_RESNET50 = "rvm_resnet50"
     ENGINE_RVM_MOBILENET = "rvm_mobilenetv3"
     ENGINE_MEDIAPIPE = "mediapipe"
@@ -40,667 +58,486 @@ class BackgroundEngine:
     MODE_SOLID = "solid"
     MODE_IMAGE = "image"
 
-    def __init__(self, model_path: str = None,
-                 models_dir: str = None,
-                 use_guided_filter: bool = True,
-                 enable_relighting: bool = True,
-                 engine_type: str = None):
-        # Resolve models directory
-        if models_dir and os.path.exists(models_dir):
+    SMALL_W = PersonIsolator.WORK_W
+
+    def __init__(self, model_path: str = None, models_dir: str = None, use_guided_filter: bool = True,
+                 enable_relighting: bool = False, engine_type: str = None):
+        if models_dir and os.path.isdir(models_dir):
             self.models_dir = models_dir
         elif model_path and os.path.exists(model_path):
-            self.models_dir = os.path.dirname(model_path) if os.path.isfile(model_path) else model_path
+            self.models_dir = os.path.dirname(model_path)
         else:
             self.models_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models"))
+        seg_path = model_path if (model_path and os.path.isfile(model_path)) else os.path.join(self.models_dir, "selfie_segmenter.tflite")
 
-        self.mediapipe_model_path = model_path if (model_path and os.path.isfile(model_path)) else os.path.join(self.models_dir, "selfie_segmenter.tflite")
-        
-        # Check CUDA and Torch availability
-        self.has_cuda = HAS_TORCH and torch.cuda.is_available()
-        self.device = "cuda" if self.has_cuda else "cpu"
-        self.use_half = self.has_cuda
+        self.rvm = RVMRunner(self.models_dir)
+        self.has_cuda = self.rvm.cuda
+        self.engine_type = engine_type or (self.ENGINE_RVM_MOBILENET if self.has_cuda else self.ENGINE_MEDIAPIPE)
 
-        # Default engine: Ultra-fast Neural RVM MobileNet on CUDA (39 FPS on RTX 3060)
-        if engine_type:
-            self.engine_type = engine_type
-        else:
-            self.engine_type = self.ENGINE_RVM_MOBILENET if self.has_cuda else self.ENGINE_MEDIAPIPE
-
-        # RVM neural state
-        self.rvm_model = None
-        self.current_rvm_variant = None
-        self.rvm_rec = [None, None, None, None]
-        self.last_rvm_shape = None
-
-        # Fine-tuning properties: 45% detail for sharp fingers, 0 choke to prevent finger erosion
-        self.downsample_ratio = 0.45
-        self.edge_choke = 0
-        self.enable_decontamination = True
-        self._latest_hand_mask = None
-        self._last_hand_ts = -1
-        self._prev_hand_mask = None
-        self._hand_miss_count = 0
-
-        # Primary-person isolation: keeps only the tracked subject (or explicitly
-        # included regions) in the foreground matte, so bystanders walking through
-        # frame are excluded by default. Opt-in click-to-include/exclude overrides.
-        self.person_isolation_enabled = False
-        self.forced_include_points = []   # list of (x_norm, y_norm)
-        self.forced_exclude_points = []   # list of (x_norm, y_norm)
-        self._primary_centroid_norm = None
-
-        # Real-time Hand Gesture Landmark Detector for Zero-Drop Hand Fusion
-        self.hand_landmarker = None
-        hand_model_path = os.path.join(self.models_dir, "hand_landmarker.task")
-        if os.path.exists(hand_model_path):
-            try:
-                base_options = python.BaseOptions(model_asset_path=hand_model_path)
-                options = vision.HandLandmarkerOptions(
-                    base_options=base_options,
-                    running_mode=vision.RunningMode.VIDEO,
-                    num_hands=2,
-                    min_hand_detection_confidence=0.18,
-                    min_hand_presence_confidence=0.18
-                )
-                self.hand_landmarker = vision.HandLandmarker.create_from_options(options)
-            except Exception as e:
-                print(f"[BackgroundEngine] HandLandmarker init warning: {e}")
-
-        # Initialize MediaPipe segmenter if available
         self.segmenter = None
-        if os.path.exists(self.mediapipe_model_path):
+        if os.path.exists(seg_path):
             try:
-                base_options = python.BaseOptions(model_asset_path=self.mediapipe_model_path)
-                options = vision.ImageSegmenterOptions(
-                    base_options=base_options,
+                opts = vision.ImageSegmenterOptions(
+                    base_options=python.BaseOptions(model_asset_path=seg_path),
                     running_mode=vision.RunningMode.VIDEO,
-                    output_confidence_masks=True
-                )
-                self.segmenter = vision.ImageSegmenter.create_from_options(options)
+                    output_confidence_masks=True)
+                self.segmenter = vision.ImageSegmenter.create_from_options(opts)
             except Exception as e:
-                print(f"[BackgroundEngine] MediaPipe Segmenter init warning: {e}")
+                print(f"[BackgroundEngine] MediaPipe segmenter init warning: {e}")
+        self._seg_ts = -1
+        self._mp_prev = None
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="Segmenter")
 
-        # Preload RVM model if using neural engine
-        if self.engine_type in (self.ENGINE_RVM_RESNET50, self.ENGINE_RVM_MOBILENET):
-            self._ensure_rvm_loaded(self.engine_type)
-
-        self.last_timestamp_ms = -1
-        self.custom_bg_img = None
-        self.custom_bg_cached = None
-        self.custom_bg_shape = None
-        self._gpu_studio_bg = None
-        self._gpu_studio_shape = None
-        self._gpu_custom_bg = None
-        self._gpu_custom_shape = None
-
+        # Settings (the pipeline/UI writes these directly)
+        self.mode = self.MODE_ORIGINAL
+        self.blur_strength = 55
+        self.solid_color = (0, 255, 0)          # BGR — chroma green by default
+        self.downsample_ratio = 0.4
+        self.edge_choke = 0
+        self.hardness = 0.5
+        self.enable_decontamination = True
         self.use_guided_filter = use_guided_filter
-        self.relighting_engine = EnvironmentRelightingEngine(enabled=enable_relighting)
+        self.hand_prior = True
+        self.relighting_engine = EnvironmentRelightingEngine(enabled=enable_relighting, rim_intensity=0.2,
+                                                             ambient_intensity=0.0, spill_intensity=0.0)
+        self.isolator = PersonIsolator()
 
-        # Check for guided filter availability
-        self._has_guided_filter = hasattr(cv2, 'ximgproc') and hasattr(cv2.ximgproc, 'guidedFilter')
+        self.custom_bg_img = None
+        self._cpu_cache = {}
+        self._gpu_cache = {}
+        self._plate_t = None
+        self._plate_valid_t = None
+        self._plate_np = None
+        self._plate_valid_np = None
+        self._has_guided = hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "guidedFilter")
 
-    def _ensure_rvm_loaded(self, engine_type: str) -> bool:
-        if not HAS_TORCH:
-            print("[BackgroundEngine] PyTorch not available, falling back to MediaPipe.")
-            self.engine_type = self.ENGINE_MEDIAPIPE
-            return False
+        if self.engine_type != self.ENGINE_MEDIAPIPE:
+            if not self.rvm.load(self._variant(self.engine_type)):
+                self.engine_type = self.ENGINE_MEDIAPIPE
 
-        variant = "resnet50" if engine_type == self.ENGINE_RVM_RESNET50 else "mobilenetv3"
-        if self.current_rvm_variant == variant and self.rvm_model is not None:
-            return True
+    # ------------------------------------------------------------------ settings
+    @staticmethod
+    def _variant(engine_type):
+        return "resnet50" if engine_type == BackgroundEngine.ENGINE_RVM_RESNET50 else "mobilenetv3"
 
-        weight_file = f"rvm_{variant}.pth"
-        weight_path = os.path.join(self.models_dir, weight_file)
-        if not os.path.exists(weight_path):
-            cache_path = os.path.expanduser(f"~/.cache/torch/hub/checkpoints/{weight_file}")
-            if os.path.exists(cache_path):
-                weight_path = cache_path
+    @property
+    def person_isolation_enabled(self):
+        return self.isolator.enabled
 
-        try:
-            from app.models.rvm_net.model import MattingNetwork
-            model = MattingNetwork(variant)
-            if os.path.exists(weight_path):
-                state_dict = torch.load(weight_path, map_location='cpu', weights_only=True)
-                model.load_state_dict(state_dict)
-            else:
-                hub_model = torch.hub.load('PeterL1n/RobustVideoMatting', variant)
-                model.load_state_dict(hub_model.state_dict())
-
-            if self.device == "cuda":
-                model = model.cuda()
-                if self.use_half:
-                    model = model.half()
-            else:
-                model = model.cpu().float()
-
-            model.eval()
-            self.rvm_model = model
-            self.current_rvm_variant = variant
-            self.rvm_rec = [None, None, None, None]
-            self.last_rvm_shape = None
-            print(f"[BackgroundEngine] Successfully loaded Neural RVM ({variant}) on {self.device} (FP16={self.use_half}).")
-            return True
-        except Exception as e:
-            print(f"[BackgroundEngine] Failed to load RVM ({variant}): {e}. Falling back to MediaPipe.")
-            self.engine_type = self.ENGINE_MEDIAPIPE
-            return False
+    def set_person_isolation(self, enabled: bool):
+        self.isolator.enabled = bool(enabled)
+        if not enabled:
+            self.isolator.reset()
 
     def set_engine_type(self, engine_type: str):
         if engine_type == self.engine_type:
             return
         if engine_type in (self.ENGINE_RVM_RESNET50, self.ENGINE_RVM_MOBILENET):
-            if self._ensure_rvm_loaded(engine_type):
+            if self.rvm.load(self._variant(engine_type)):
                 self.engine_type = engine_type
         else:
             self.engine_type = self.ENGINE_MEDIAPIPE
         self.reset_states()
 
     def reset_states(self):
-        """Clears recurrent hidden memory to refresh temporal states."""
-        self.rvm_rec = [None, None, None, None]
-        self.last_rvm_shape = None
+        self.rvm.reset_state()
+        self._mp_prev = None
+        self._plate_t = self._plate_valid_t = None
+        self._plate_np = self._plate_valid_np = None
+
+    def reset_clean_plate(self):
+        self._plate_t = self._plate_valid_t = None
+        self._plate_np = self._plate_valid_np = None
 
     def set_custom_image(self, image_path: str) -> bool:
         if image_path and os.path.exists(image_path):
-            img = cv2.imread(image_path)
+            img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
             if img is not None:
                 self.custom_bg_img = img
-                self.custom_bg_cached = None
-                self._gpu_custom_bg = None
-                self._gpu_custom_shape = None
+                self._cpu_cache.pop("image", None)
+                self._gpu_cache.pop("image", None)
                 return True
         return False
 
-    def set_relighting_params(self, enabled: bool = None, rim_intensity: float = None, ambient_intensity: float = None):
+    def set_solid_color(self, bgr):
+        self.solid_color = tuple(int(c) for c in bgr)
+        self._cpu_cache.pop("solid", None)
+        self._gpu_cache.pop("solid", None)
+
+    def set_relighting_params(self, enabled=None, rim_intensity=None, ambient_intensity=None):
         if enabled is not None:
-            self.relighting_engine.enabled = enabled
+            self.relighting_engine.enabled = bool(enabled)
         if rim_intensity is not None:
             self.relighting_engine.rim_intensity = float(rim_intensity)
         if ambient_intensity is not None:
             self.relighting_engine.ambient_intensity = float(ambient_intensity)
 
-    def detect_hand_mask(self, frame_bgr: np.ndarray, timestamp_ms: int = None) -> np.ndarray:
-        """
-        High-speed real-time anatomical hand gesture mask generator.
-        Runs at proxy resolution and renders solid anatomical palm + wrist anchor + finger capsules
-        with temporal persistence to ensure gestures (waving, peace, pointing) are NEVER dropped.
-        """
-        if self.hand_landmarker is None:
-            self._latest_hand_mask = None
+    def uses_gpu_matting(self) -> bool:
+        return self.engine_type != self.ENGINE_MEDIAPIPE and self.rvm.model is not None
+
+    def needs_matte(self, extra: bool = False) -> bool:
+        return self.mode != self.MODE_ORIGINAL or self.isolator.enabled or extra
+
+    # ------------------------------------------------------------------ phase 1
+    def begin(self, frame_bgr: np.ndarray, timestamp_ms: int, need_matte: bool = None):
+        if need_matte is None:
+            need_matte = self.needs_matte()
+        if not need_matte:
             return None
+        t0 = time.perf_counter()
+        if self.engine_type != self.ENGINE_MEDIAPIPE and self.rvm.load(self._variant(self.engine_type)):
+            ds = float(np.clip(self.downsample_ratio, 0.15, 1.0))
+            src, fgr, pha = self.rvm.run(frame_bgr, ds)
+            return {"kind": "rvm", "src": src, "fgr": fgr, "pha": pha, "t0": t0}
+        if self.segmenter is None:
+            return None
+        fut = self._pool.submit(self._mp_confidence, frame_bgr, timestamp_ms)
+        return {"kind": "mp", "future": fut, "t0": t0}
 
-        h, w = frame_bgr.shape[:2]
-        proxy_w = 480
-        proxy_h = int(proxy_w * h / w)
-        proxy = cv2.resize(frame_bgr, (proxy_w, proxy_h), interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(proxy, cv2.COLOR_BGR2RGB)
-        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
-        if not hasattr(self, '_last_hand_ts'):
-            self._last_hand_ts = -1
-        if timestamp_ms is None or timestamp_ms <= self._last_hand_ts:
-            self._last_hand_ts = self._last_hand_ts + 1 if self._last_hand_ts >= 0 else 0
-            ts = self._last_hand_ts
-        else:
-            self._last_hand_ts = timestamp_ms
-            ts = timestamp_ms
-
+    def quick_alpha(self, frame_bgr: np.ndarray, timestamp_ms: int):
+        """Cheap low-res person mask (MediaPipe) — used as a presence sensor for the privacy guard."""
+        if self.segmenter is None:
+            return None
         try:
-            res = self.hand_landmarker.detect_for_video(mp_img, ts)
-            if not res.hand_landmarks or len(res.hand_landmarks) == 0:
-                # Anti-flicker temporal coasting during rapid motions/misses (up to 3 frames ~ 100ms)
-                if self._prev_hand_mask is not None and self._hand_miss_count < 3:
-                    self._hand_miss_count += 1
-                    coasted = cv2.GaussianBlur(self._prev_hand_mask, (15, 15), 0)
-                    coasted = (coasted.astype(np.float32) * 0.85).astype(np.uint8)
-                    self._prev_hand_mask = coasted.copy()
-                    self._latest_hand_mask = coasted
-                    return coasted
-                else:
-                    self._prev_hand_mask = None
-                    self._latest_hand_mask = None
-                    return None
-
-            self._hand_miss_count = 0
-            hand_mask = np.zeros((h, w), dtype=np.uint8)
-            for hand_lmks in res.hand_landmarks:
-                pts = np.array([(int(lm.x * w), int(lm.y * h)) for lm in hand_lmks], dtype=np.int32)
-                palm_w = np.linalg.norm(pts[5] - pts[17])
-                finger_thick = max(18, int(palm_w * 0.36))
-
-                # Palm polygon & convex hull
-                cv2.fillPoly(hand_mask, [pts[[0, 1, 2, 5, 9, 13, 17]]], 255)
-                hull = cv2.convexHull(pts)
-                cv2.fillConvexPoly(hand_mask, hull, 255)
-
-                # Seamless Wrist & Forearm anchor capsule (connects wrist to body)
-                wrist_pt = pts[0]
-                mcp_mid = pts[9]
-                v_arm = wrist_pt - mcp_mid
-                norm_v = np.linalg.norm(v_arm)
-                if norm_v > 2:
-                    p_forearm = (wrist_pt + (v_arm / norm_v) * (palm_w * 0.85)).astype(np.int32)
-                    cv2.line(hand_mask, tuple(wrist_pt), tuple(p_forearm), 255, int(palm_w * 0.75))
-                    cv2.circle(hand_mask, tuple(p_forearm), int(palm_w * 0.38), 255, -1)
-
-                # 5 finger bone capsules
-                chains = [
-                    [1, 2, 3, 4],       # Thumb
-                    [5, 6, 7, 8],       # Index
-                    [9, 10, 11, 12],    # Middle
-                    [13, 14, 15, 16],   # Ring
-                    [17, 18, 19, 20]    # Pinky
-                ]
-                for chain in chains:
-                    for i in range(len(chain) - 1):
-                        p1 = tuple(pts[chain[i]])
-                        p2 = tuple(pts[chain[i+1]])
-                        cv2.line(hand_mask, p1, p2, 255, finger_thick)
-                        cv2.circle(hand_mask, p2, finger_thick // 2, 255, -1)
-
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-            hand_mask = cv2.dilate(hand_mask, kernel)
-            hand_mask = cv2.GaussianBlur(hand_mask, (7, 7), 0)
-            self._prev_hand_mask = hand_mask.copy()
-            self._latest_hand_mask = hand_mask
-            return hand_mask
+            conf = self._pool.submit(self._mp_confidence, frame_bgr, timestamp_ms).result()
         except Exception:
-            if self._prev_hand_mask is not None and self._hand_miss_count < 3:
-                self._hand_miss_count += 1
-                return self._prev_hand_mask
-            self._latest_hand_mask = None
             return None
+        sh = max(8, int(round(self.SMALL_W * conf.shape[0] / conf.shape[1])))
+        return cv2.resize(conf, (self.SMALL_W, sh), interpolation=cv2.INTER_AREA)
 
-    def get_latest_hand_mask(self) -> np.ndarray:
-        return getattr(self, '_latest_hand_mask', None)
-
-    # ------------------------------------------------------------------
-    # Primary-Person Isolation & Click-to-Include/Exclude
-    # ------------------------------------------------------------------
-    def set_person_isolation(self, enabled: bool):
-        self.person_isolation_enabled = bool(enabled)
-
-    def add_forced_point(self, x_norm: float, y_norm: float, mode: str = "include"):
-        """Registers a click-to-include or click-to-exclude spot (normalized 0-1 frame coords)."""
-        pt = (float(np.clip(x_norm, 0.0, 1.0)), float(np.clip(y_norm, 0.0, 1.0)))
-        target = self.forced_include_points if mode == "include" else self.forced_exclude_points
-        # Toggle off if clicking near an existing point of the same kind
-        for i, (ex, ey) in enumerate(target):
-            if (ex - pt[0]) ** 2 + (ey - pt[1]) ** 2 < 0.02 ** 2:
-                target.pop(i)
-                return
-        target.append(pt)
-
-    def clear_forced_points(self):
-        self.forced_include_points = []
-        self.forced_exclude_points = []
-        self._primary_centroid_norm = None
-
-    def _compute_isolation_keep_mask(self, alpha_small: np.ndarray, face_center_norm) -> np.ndarray:
-        """
-        alpha_small: float32 array in [0, 1] at low resolution.
-        Returns a float32 keep-mask (same shape) that is 1.0 for the primary
-        subject (and any forced-include blobs) and 0.0 elsewhere, feathered.
-        Falls back to an all-ones mask whenever there is nothing to isolate
-        (a single blob / no detections), so it never clips a normal solo frame.
-        """
-        h, w = alpha_small.shape
-        binary = (alpha_small > 0.5).astype(np.uint8)
-
-        # Merge near-touching fragments (e.g. a hand slightly detached from a
-        # sleeve due to matte noise) so they aren't misclassified as a separate person.
-        close_k = max(3, (min(h, w) // 20) | 1)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
-        if num_labels <= 2:
-            # Zero or one foreground blob — nothing to isolate, pass everything through.
-            if num_labels == 2:
-                self._primary_centroid_norm = (centroids[1][0] / w, centroids[1][1] / h)
-            return np.ones((h, w), dtype=np.float32)
-
-        min_area = max(6, int(0.0015 * w * h))
-        candidates = [i for i in range(1, num_labels) if stats[i, cv2.CC_STAT_AREA] >= min_area]
-        if not candidates:
-            return np.ones((h, w), dtype=np.float32)
-
-        def nearest_to(px, py):
-            best_i, best_d = None, None
-            for i in candidates:
-                cx, cy = centroids[i]
-                d = (cx - px) ** 2 + (cy - py) ** 2
-                if best_d is None or d < best_d:
-                    best_d, best_i = d, i
-            return best_i
-
-        primary_label = None
-        if face_center_norm is not None:
-            primary_label = nearest_to(face_center_norm[0] * w, face_center_norm[1] * h)
-        if primary_label is None and self._primary_centroid_norm is not None:
-            primary_label = nearest_to(self._primary_centroid_norm[0] * w, self._primary_centroid_norm[1] * h)
-        if primary_label is None:
-            primary_label = max(candidates, key=lambda i: stats[i, cv2.CC_STAT_AREA])
-
-        self._primary_centroid_norm = (centroids[primary_label][0] / w, centroids[primary_label][1] / h)
-
-        keep_labels = {primary_label}
-        include_radius = 0.15 * max(w, h)
-        for (ix, iy) in self.forced_include_points:
-            px, py = ix * w, iy * h
-            for i in candidates:
-                cx, cy = centroids[i]
-                if (cx - px) ** 2 + (cy - py) ** 2 < include_radius ** 2:
-                    keep_labels.add(i)
-
-        keep_mask = np.isin(labels, list(keep_labels)).astype(np.float32)
-
-        exclude_radius = 0.15 * max(w, h)
-        for (ex_n, ey_n) in self.forced_exclude_points:
-            px, py = ex_n * w, ey_n * h
-            yy, xx = np.ogrid[:h, :w]
-            dist2 = (xx - px) ** 2 + (yy - py) ** 2
-            keep_mask[dist2 < exclude_radius ** 2] = 0.0
-
-        # Feather the blob boundary so the cut doesn't look hard-edged.
-        keep_mask = cv2.GaussianBlur(keep_mask, (0, 0), sigmaX=max(1.0, min(h, w) * 0.01))
-        return keep_mask
-
-    def process(self, frame_bgr: np.ndarray,
-                mode: str = "blur",
-                blur_strength: int = 45,
-                solid_color: tuple = (15, 20, 25),
-                feather_radius: int = 7,
-                timestamp_ms: int = None,
-                engine_type: str = None,
-                downsample_ratio: float = None,
-                edge_choke: int = None,
-                enable_decontamination: bool = None,
-                hand_mask: np.ndarray = None,
-                face_center_norm=None) -> np.ndarray:
+    def _mp_confidence(self, frame_bgr, timestamp_ms):
         h, w = frame_bgr.shape[:2]
+        pw = 320
+        ph = max(8, int(round(h * pw / w)))
+        rgb = cv2.cvtColor(cv2.resize(frame_bgr, (pw, ph), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
+        if timestamp_ms <= self._seg_ts:
+            timestamp_ms = self._seg_ts + 1
+        self._seg_ts = timestamp_ms
+        res = self.segmenter.segment_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), timestamp_ms)
+        if not res.confidence_masks:
+            return np.zeros((ph, pw), np.float32)
+        m = res.confidence_masks[-1].numpy_view()
+        if m.ndim == 3:
+            m = m[:, :, 0]
+        return np.ascontiguousarray(m, dtype=np.float32)
 
-        if timestamp_ms is None or timestamp_ms <= self.last_timestamp_ms:
-            self.last_timestamp_ms = self.last_timestamp_ms + 1 if self.last_timestamp_ms >= 0 else 0
-            timestamp_ms = self.last_timestamp_ms
+    # ------------------------------------------------------------------ phase 2
+    def finish(self, handle, frame_bgr: np.ndarray, hands=None, hands_fresh: bool = False,
+               head_bbox=None, want_alpha_full: bool = False) -> BgResult:
+        if handle is None:
+            return BgResult(frame_bgr)
+        h, w = frame_bgr.shape[:2]
+        head_n = None
+        if head_bbox is not None:
+            x0, y0, x1, y1 = head_bbox
+            head_n = (x0 / w, y0 / h, x1 / w, y1 / h)
+        if handle["kind"] == "rvm":
+            res = self._finish_rvm(handle, frame_bgr, hands, hands_fresh, head_n, want_alpha_full)
         else:
-            self.last_timestamp_ms = timestamp_ms
+            res = self._finish_mp(handle, frame_bgr, hands, hands_fresh, head_n, want_alpha_full)
+        res.bg_ms = (time.perf_counter() - handle["t0"]) * 1000.0
+        if self.isolator.enabled:
+            res.people = self.isolator.people()
+        return res
 
-        # Always resolve the hand occlusion mask (even in MODE_ORIGINAL) so this
-        # is the single shared HandLandmarker instance for the whole pipeline —
-        # downstream consumers (e.g. the scribble engine) reuse it instead of
-        # running a second, redundant hand-detection model every frame.
-        if hand_mask is None:
-            hand_mask = self.detect_hand_mask(frame_bgr, timestamp_ms)
+    def process(self, frame_bgr, mode=None, blur_strength=None, timestamp_ms=None, engine_type=None,
+                downsample_ratio=None, edge_choke=None, enable_decontamination=None, hand_mask=None,
+                face_center_norm=None, **_):
+        """Single-call convenience wrapper (tests / scripts)."""
+        if mode is not None:
+            self.mode = mode
+        if blur_strength is not None:
+            self.blur_strength = blur_strength
+        if engine_type is not None:
+            self.set_engine_type(engine_type)
+        if downsample_ratio is not None:
+            self.downsample_ratio = downsample_ratio
+        if edge_choke is not None:
+            self.edge_choke = edge_choke
+        if enable_decontamination is not None:
+            self.enable_decontamination = enable_decontamination
+        ts = int(time.time() * 1000) if timestamp_ms is None else timestamp_ms
+        return self.finish(self.begin(frame_bgr, ts), frame_bgr).composite
 
-        if mode == self.MODE_ORIGINAL:
-            return frame_bgr
+    # ------------------------------------------------------------------ GPU (RVM)
+    def _t(self, arr_u8, size_hw=None):
+        """uint8 HxW numpy -> (1,1,H,W) tensor in [0,1] on the matting device, optionally resized."""
+        t = torch.from_numpy(arr_u8).to(self.rvm.device, non_blocking=False).to(self.rvm.dtype).div_(255.0)
+        t = t.view(1, 1, *arr_u8.shape[:2])
+        if size_hw is not None and tuple(arr_u8.shape[:2]) != tuple(size_hw):
+            t = F.interpolate(t, size=size_hw, mode="bilinear", align_corners=False)
+        return t
 
-        active_engine = engine_type if engine_type is not None else self.engine_type
-        ds_ratio = downsample_ratio if downsample_ratio is not None else self.downsample_ratio
-        choke = edge_choke if edge_choke is not None else self.edge_choke
-        decontaminate = enable_decontamination if enable_decontamination is not None else self.enable_decontamination
+    def _finish_rvm(self, hd, frame_bgr, hands, hands_fresh, head_n, want_alpha_full):
+        src, fgr, pha = hd["src"], hd["fgr"], hd["pha"]
+        H, W = frame_bgr.shape[:2]
+        sw = self.SMALL_W
+        sh = max(8, int(round(sw * H / W)))
+        with torch.no_grad():
+            choke = int(self.edge_choke)
+            if choke < 0:
+                k = -choke * 2 + 1
+                pha = -F.max_pool2d(-pha, k, stride=1, padding=k // 2)
+            elif choke > 0:
+                k = choke * 2 + 1
+                pha = F.max_pool2d(pha, k, stride=1, padding=k // 2)
 
-        mask_u8 = None
-        fg_frame = frame_bgr
+            if self.hand_prior and hands:
+                s = 0.25
+                hs, ws = max(8, int(H * s)), max(8, int(W * s))
+                boost = HandTracker.draw_mask((hs, ws), hands, scale=s, thickness=1.35)
+                if boost.any():
+                    bt = self._t(boost, (H, W))
+                    pha = torch.where(bt > 0.5, torch.maximum(pha, (pha * 3.0).clamp(0.0, 1.0)), pha)
+                    if hands_fresh:
+                        core = HandTracker.draw_mask((hs, ws), hands, scale=s, core_only=True)
+                        pha = torch.maximum(pha, (self._t(core, (H, W)) - 0.5).clamp(min=0.0) * 2.0)
 
-        # ----------------------------------------------------
-        # 1. HIGH-SPEED GPU NEURAL RVM MATTING (ResNet50 / MobileNetV3)
-        # ----------------------------------------------------
-        if active_engine in (self.ENGINE_RVM_RESNET50, self.ENGINE_RVM_MOBILENET) and self._ensure_rvm_loaded(active_engine):
-            if self.device == "cuda":
-                if self.last_rvm_shape != (h, w, ds_ratio):
-                    self.rvm_rec = [None, None, None, None]
-                    self.last_rvm_shape = (h, w, ds_ratio)
+            hd_ = float(np.clip(self.hardness, 0.0, 1.0))
+            if hd_ > 0.01:
+                lo, hi = 0.12 * hd_, 1.0 - 0.3 * hd_
+                pha = ((pha - lo) / (hi - lo)).clamp(0.0, 1.0)
 
-                rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                src_t = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).cuda(non_blocking=True)
-                src_t = src_t.half() if self.use_half else src_t.float()
-                src_t.div_(255.0)
+            pha_pre = pha
+            alpha_small = F.interpolate(pha.float(), size=(sh, sw), mode="area")[0, 0].cpu().numpy()
 
-                with torch.no_grad():
-                    fgr, pha, *self.rvm_rec = self.rvm_model(
-                        src_t, *self.rvm_rec, downsample_ratio=ds_ratio
-                    )
+            removal = None
+            if self.isolator.enabled:
+                keep = self.isolator.update(alpha_small, head_n)
+                self._update_plate_gpu(src, pha_pre)
+                if keep is not None:
+                    kt = torch.from_numpy(keep).to(self.rvm.device, dtype=self.rvm.dtype).view(1, 1, sh, sw)
+                    kt = F.interpolate(kt, size=(H, W), mode="bilinear", align_corners=False)
+                    force = kt > 1.5
+                    kk = kt.clamp(0.0, 1.0)
+                    removal = torch.where(force, torch.zeros_like(pha), pha * (1.0 - kk))
+                    pha = torch.where(force, torch.ones_like(pha), pha * kk)
+                    alpha_small = np.where(keep > 1.5, 1.0, alpha_small * np.clip(keep, 0.0, 1.0)).astype(np.float32)
 
-                    # Edge Choke directly on GPU Tensor Cores (0.1ms) applied to body
-                    if choke < 0:
-                        k_size = abs(choke) * 2 + 1
-                        pha = -torch.nn.functional.max_pool2d(-pha, k_size, stride=1, padding=k_size // 2)
-                    elif choke > 0:
-                        k_size = choke * 2 + 1
-                        pha = torch.nn.functional.max_pool2d(pha, k_size, stride=1, padding=k_size // 2)
+            alpha_full = None
+            if want_alpha_full:
+                alpha_full = (pha[0, 0] * 255.0).to(torch.uint8).cpu().numpy()
 
-                    # REAL-TIME HAND GESTURE SOLIDIFICATION FUSION ON GPU
-                    dtype_t = torch.float16 if self.use_half else torch.float32
-                    hand_t = None
-                    if hand_mask is not None and np.any(hand_mask > 20):
-                        hand_t = torch.from_numpy(hand_mask).to(device="cuda", dtype=dtype_t).div_(255.0).view(1, 1, h, w)
-                        # Hand is guaranteed 100% opaque without cutoff or see-through
-                        pha = torch.maximum(pha, (hand_t * 1.30).clamp(0.0, 1.0))
-                        # Lightly refresh recurrent state to fight ghosting during rapid
-                        # gestures. The hand's own pixels are already guaranteed solid by
-                        # the maximum() above, so this only needs to nudge the surrounding
-                        # motion wake — a mild 0.85 decay (vs. the previous 0.70) keeps far
-                        # more of RVM's temporal consistency instead of discarding it.
-                        self.rvm_rec = [r * 0.85 if r is not None else None for r in self.rvm_rec]
+            if self.mode == self.MODE_ORIGINAL:
+                if removal is None:
+                    return BgResult(frame_bgr, alpha_small, alpha_full, engine="rvm")
+                fill = self._fill_gpu(src, pha_pre)
+                out = src + (fill - src) * removal
+                return BgResult(self._download(out), alpha_small, alpha_full, engine="rvm")
 
-                    # Alpha solidity boost: guarantees hands, arms, and torso are 100% opaque without ghosting
-                    pha = torch.where(pha > 0.35, torch.clamp((pha - 0.05) * 1.30, 0.0, 1.0), pha * 0.70)
-                    pha = torch.clamp(pha, 0.0, 1.0)
+            src_clean = src if removal is None else src + (self._fill_gpu(src, pha_pre) - src) * removal
+            bg = self._bg_gpu(src_clean, H, W)
+            if bg is None:
+                return BgResult(frame_bgr, alpha_small, alpha_full, engine="rvm")
 
-                    # Primary-person isolation: restrict the matte to the tracked subject
-                    # (plus any click-to-include blobs), excluding bystanders by default.
-                    if self.person_isolation_enabled:
-                        small_w = max(64, min(200, w // 4))
-                        small_h = max(36, int(small_w * h / w))
-                        pha_small = torch.nn.functional.interpolate(
-                            pha.float(), size=(small_h, small_w), mode='bilinear', align_corners=False
-                        )[0, 0].cpu().numpy()
-                        keep_small = self._compute_isolation_keep_mask(pha_small, face_center_norm)
-                        keep_full = cv2.resize(keep_small, (w, h), interpolation=cv2.INTER_LINEAR)
-                        keep_t = torch.from_numpy(keep_full).to(device="cuda", dtype=dtype_t).view(1, 1, h, w)
-                        pha = pha * keep_t
+            fg = torch.where(pha > 0.85, src, fgr) if self.enable_decontamination else src
+            if removal is not None:
+                fg = src_clean if not self.enable_decontamination else torch.where(pha > 0.85, src_clean, fgr)
+            rl = self.relighting_engine
+            if rl.enabled and rl.rim_intensity > 0.02:
+                inner = -F.max_pool2d(-pha, 5, stride=1, padding=2)
+                rim = (pha - inner).clamp(0.0, 1.0)
+                fg = (fg + bg * rim * min(0.35, 0.3 * rl.rim_intensity)).clamp(0.0, 1.0)
+            comp = bg + (fg - bg) * pha
+            return BgResult(self._download(comp), alpha_small, alpha_full, engine="rvm")
 
-                    # Keep original camera colors inside the subject, only applying RVM decontamination at boundaries
-                    if decontaminate:
-                        fg_t = torch.where(pha > 0.85, src_t, fgr)
-                    else:
-                        fg_t = src_t
+    def _download(self, t_rgb):
+        return (t_rgb[0].flip(0).permute(1, 2, 0).clamp(0.0, 1.0) * 255.0).to(torch.uint8).contiguous().cpu().numpy()
 
-                    # Pristine raw camera pixels inside detected hand (zero decontamination blur or discoloration)
-                    if hand_t is not None:
-                        fg_t = torch.where(hand_t > 0.05, src_t, fg_t)
-
-
-                    # Prepare Background Tensor on GPU
-                    bg_t = None
-                    if mode == self.MODE_BLUR:
-                        # Ultra-fast GPU Tensor Core spatial pyramid blur (0.2ms vs 15ms on CPU)
-                        ds_factor = max(4, min(12, int(blur_strength / 7)))
-                        blur_h, blur_w = max(48, h // ds_factor), max(64, w // ds_factor)
-                        small = torch.nn.functional.interpolate(src_t, size=(blur_h, blur_w), mode='bilinear', align_corners=False)
-                        k_pool = 7
-                        small_pooled = torch.nn.functional.avg_pool2d(small, k_pool, stride=1, padding=k_pool // 2)
-                        bg_t = torch.nn.functional.interpolate(small_pooled, size=(h, w), mode='bilinear', align_corners=False)
-
-                    elif mode == self.MODE_STUDIO:
-                        if self._gpu_studio_bg is None or self._gpu_studio_shape != (h, w):
-                            y_indices = np.linspace(0.12, 0.28, h)[:, np.newaxis, np.newaxis]
-                            base_col = np.array([48, 38, 32], dtype=np.float32) / 255.0  # RGB
-                            studio_rgb = (base_col * y_indices).astype(np.float32)
-                            t_studio = torch.from_numpy(studio_rgb).permute(2, 0, 1).unsqueeze(0).cuda(non_blocking=True)
-                            self._gpu_studio_bg = t_studio.half() if self.use_half else t_studio
-                            self._gpu_studio_shape = (h, w)
-                        bg_t = self._gpu_studio_bg
-
-                    elif mode == self.MODE_SOLID:
-                        # solid_color is (B, G, R)
-                        col_rgb = (solid_color[2] / 255.0, solid_color[1] / 255.0, solid_color[0] / 255.0)
-                        dtype_t = torch.float16 if self.use_half else torch.float32
-                        bg_t = torch.tensor(col_rgb, device="cuda", dtype=dtype_t).view(1, 3, 1, 1).expand(1, 3, h, w)
-
-                    elif mode == self.MODE_IMAGE and self.custom_bg_img is not None:
-                        if self._gpu_custom_bg is None or self._gpu_custom_shape != (h, w):
-                            bg_h, bg_w = self.custom_bg_img.shape[:2]
-                            scale = max(w / bg_w, h / bg_h)
-                            nw, nh = int(bg_w * scale), int(bg_h * scale)
-                            resized = cv2.resize(self.custom_bg_img, (nw, nh), interpolation=cv2.INTER_AREA)
-                            x_off = (nw - w) // 2
-                            y_off = (nh - h) // 2
-                            cropped_bgr = resized[y_off:y_off+h, x_off:x_off+w]
-                            cropped_rgb = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
-                            t_custom = torch.from_numpy(cropped_rgb).permute(2, 0, 1).unsqueeze(0).cuda(non_blocking=True)
-                            t_custom = t_custom.half() if self.use_half else t_custom.float()
-                            self._gpu_custom_bg = t_custom.div_(255.0)
-                            self._gpu_custom_shape = (h, w)
-                        bg_t = self._gpu_custom_bg
-
-                    if bg_t is not None:
-                        # Light wrap / rim lighting directly on GPU (strictly subtle edge rim)
-                        if self.relighting_engine.enabled and self.relighting_engine.rim_intensity > 0.05:
-                            inner = -torch.nn.functional.max_pool2d(-pha, 3, stride=1, padding=1)
-                            rim_mask = (pha - inner).clamp(0.0, 1.0)
-                            wrap_amt = min(0.20, 0.15 * self.relighting_engine.rim_intensity)
-                            fg_t = (fg_t + bg_t * (rim_mask * wrap_amt)).clamp(0.0, 1.0)
-
-                        # GPU Compositing
-                        comp = fg_t.mul(pha).addcmul_(bg_t, 1.0 - pha)
-
-                        # Fast single GPU->CPU transfer of uint8 BGR
-                        return (comp[:, [2, 1, 0], :, :].clamp(0.0, 1.0) * 255.0).to(torch.uint8)[0].permute(1, 2, 0).contiguous().cpu().numpy()
-
-                # If no custom image or unrecognized mode, fallback to frame
-                return frame_bgr
-            else:
-                # CPU PyTorch fallback
-                if self.last_rvm_shape != (h, w):
-                    self.rvm_rec = [None, None, None, None]
-                    self.last_rvm_shape = (h, w)
-
-                rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                src_t = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
-                with torch.no_grad():
-                    fgr, pha, *self.rvm_rec = self.rvm_model(src_t, *self.rvm_rec, downsample_ratio=ds_ratio)
-                pha_u8 = (pha[0, 0] * 255.0).clamp(0, 255).to(torch.uint8).numpy()
-                if choke < 0:
-                    k_size = abs(choke) * 2 + 1
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-                    mask_u8 = cv2.erode(pha_u8, kernel)
-                elif choke > 0:
-                    k_size = choke * 2 + 1
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-                    mask_u8 = cv2.dilate(pha_u8, kernel)
-                else:
-                    mask_u8 = pha_u8
-                if decontaminate:
-                    fgr_u8 = (fgr[0].permute(1, 2, 0) * 255.0).clamp(0, 255).to(torch.uint8).numpy()
-                    fg_frame = cv2.cvtColor(fgr_u8, cv2.COLOR_RGB2BGR)
-                else:
-                    fg_frame = frame_bgr
-
-        # ----------------------------------------------------
-        # 2. MEDIAPIPE CPU FALLBACK
-        # ----------------------------------------------------
-        if mask_u8 is None:
-            if self.segmenter is None:
-                return frame_bgr
-
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            seg_result = self.segmenter.segment_for_video(mp_image, timestamp_ms)
-
-            if not seg_result.confidence_masks:
-                return frame_bgr
-
-            raw_mask = seg_result.confidence_masks[0].numpy_view()
-
-            if self.use_guided_filter and self._has_guided_filter:
-                pw, ph = max(320, w // 2), max(180, h // 2)
-                guide_small = cv2.resize(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY), (pw, ph), interpolation=cv2.INTER_AREA)
-                coarse_small = cv2.resize((raw_mask * 255.0).astype(np.uint8), (pw, ph), interpolation=cv2.INTER_LINEAR)
-                refined_small = cv2.ximgproc.guidedFilter(guide=guide_small, src=coarse_small, radius=4, eps=1e-2)
-                mask_u8 = cv2.resize(refined_small, (w, h), interpolation=cv2.INTER_LINEAR)
-            else:
-                coarse = (raw_mask * 255.0).astype(np.uint8)
-                if feather_radius > 1:
-                    k = feather_radius | 1
-                    coarse = cv2.GaussianBlur(coarse, (k, k), 0)
-                mask_u8 = cv2.resize(coarse, (w, h), interpolation=cv2.INTER_LINEAR)
-
-            # Fuse solid anatomical hand gesture mask into MediaPipe CPU fallback
-            if hand_mask is not None and np.any(hand_mask > 20):
-                mask_u8 = np.maximum(mask_u8, hand_mask)
-
-            fg_frame = frame_bgr
-
-        # Primary-person isolation for the CPU-side mattes (RVM-on-CPU / MediaPipe fallback)
-        if mask_u8 is not None and self.person_isolation_enabled:
-            small_w = max(64, min(200, w // 4))
-            small_h = max(36, int(small_w * h / w))
-            mask_small = cv2.resize(mask_u8, (small_w, small_h), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
-            keep_small = self._compute_isolation_keep_mask(mask_small, face_center_norm)
-            keep_full = cv2.resize(keep_small, (w, h), interpolation=cv2.INTER_LINEAR)
-            mask_u8 = (mask_u8.astype(np.float32) * keep_full).astype(np.uint8)
-
-        # ----------------------------------------------------
-        # 3. GENERATE TARGET BACKGROUND PLATE
-        # ----------------------------------------------------
+    def _bg_gpu(self, src, H, W):
+        mode = self.mode
+        dev, dt = self.rvm.device, self.rvm.dtype
         if mode == self.MODE_BLUR:
-            small_w, small_h = max(160, w // 4), max(90, h // 4)
-            small_frame = cv2.resize(frame_bgr, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
-            k_blur = max(3, (blur_strength // 2) | 1)
-            small_blurred = cv2.GaussianBlur(small_frame, (k_blur, k_blur), 0)
-            bg = cv2.resize(small_blurred, (w, h), interpolation=cv2.INTER_LINEAR)
+            f = int(max(4, min(12, self.blur_strength / 7)))
+            small = F.interpolate(src, size=(max(16, H // f), max(16, W // f)), mode="area")
+            k = 7 if self.blur_strength < 70 else 9
+            small = F.avg_pool2d(small, k, stride=1, padding=k // 2, count_include_pad=False)
+            small = F.avg_pool2d(small, k, stride=1, padding=k // 2, count_include_pad=False)
+            return F.interpolate(small, size=(H, W), mode="bilinear", align_corners=False)
+        if mode in (self.MODE_STUDIO, self.MODE_SOLID, self.MODE_IMAGE):
+            key = (mode, H, W, self.solid_color if mode == self.MODE_SOLID else None)
+            cached = self._gpu_cache.get(mode)
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            plate = self._cpu_plate(mode, H, W)
+            if plate is None:
+                return None
+            t = torch.from_numpy(np.ascontiguousarray(plate[:, :, ::-1])).to(dev).permute(2, 0, 1).unsqueeze(0).to(dt).div_(255.0)
+            self._gpu_cache[mode] = (key, t)
+            return t
+        return None
 
-        elif mode == self.MODE_STUDIO:
-            bg = np.zeros_like(frame_bgr)
-            y_indices = np.linspace(0.12, 0.28, h)[:, np.newaxis, np.newaxis]
-            base_col = np.array([32, 38, 48], dtype=np.float32)
-            bg[:] = (base_col * y_indices).astype(np.uint8)
+    def _update_plate_gpu(self, src, pha):
+        """Learns the empty background wherever nobody is standing (for erasing bystanders)."""
+        bgm = F.max_pool2d(pha, 9, stride=1, padding=4) < 0.03
+        if self._plate_t is None or self._plate_t.shape != src.shape:
+            self._plate_t = src.clone()
+            self._plate_valid_t = bgm.to(src.dtype)
+            return
+        fresh = bgm & (self._plate_valid_t < 0.5)
+        blended = self._plate_t + (src - self._plate_t) * 0.08
+        self._plate_t = torch.where(fresh, src, torch.where(bgm, blended, self._plate_t))
+        self._plate_valid_t = torch.maximum(self._plate_valid_t, bgm.to(src.dtype))
 
-        elif mode == self.MODE_SOLID:
-            bg = np.full_like(frame_bgr, solid_color, dtype=np.uint8)
+    def _fill_gpu(self, src, pha):
+        """Background to paint where a hidden person stands: learned plate, else a smeared fill."""
+        H, W = src.shape[-2:]
+        wgt = (1.0 - F.max_pool2d(pha, 9, stride=1, padding=4)).clamp(0.0, 1.0)
+        s = (max(8, H // 16), max(8, W // 16))
+        num = F.avg_pool2d(F.interpolate(src * wgt, size=s, mode="area"), 5, stride=1, padding=2)
+        den = F.avg_pool2d(F.interpolate(wgt, size=s, mode="area"), 5, stride=1, padding=2)
+        fill = F.interpolate(num / den.clamp(min=1e-3), size=(H, W), mode="bilinear", align_corners=False)
+        if self._plate_t is not None and self._plate_t.shape == src.shape:
+            fill = torch.where(self._plate_valid_t > 0.5, self._plate_t, fill)
+        return fill
 
-        elif mode == self.MODE_IMAGE and self.custom_bg_img is not None:
-            if self.custom_bg_shape != (h, w) or self.custom_bg_cached is None:
-                bg_h, bg_w = self.custom_bg_img.shape[:2]
-                scale = max(w / bg_w, h / bg_h)
-                nw, nh = int(bg_w * scale), int(bg_h * scale)
-                resized = cv2.resize(self.custom_bg_img, (nw, nh), interpolation=cv2.INTER_AREA)
-                x_off = (nw - w) // 2
-                y_off = (nh - h) // 2
-                self.custom_bg_cached = resized[y_off:y_off+h, x_off:x_off+w]
-                self.custom_bg_shape = (h, w)
-            bg = self.custom_bg_cached
+    # ------------------------------------------------------------------ CPU (MediaPipe)
+    def _finish_mp(self, hd, frame_bgr, hands, hands_fresh, head_n, want_alpha_full):
+        H, W = frame_bgr.shape[:2]
+        try:
+            conf = hd["future"].result()
+        except Exception as e:
+            print(f"[BackgroundEngine] segmentation failed: {e}")
+            return BgResult(frame_bgr)
+        ph, pw = conf.shape
+        # Temporal smoothing kills the frame-to-frame edge flicker of the per-frame segmenter.
+        if self._mp_prev is not None and self._mp_prev.shape == conf.shape:
+            m = cv2.addWeighted(conf, 0.65, self._mp_prev, 0.35, 0.0)
         else:
-            return frame_bgr
+            m = conf
+        self._mp_prev = m
 
-        # ----------------------------------------------------
-        # 4. COMPOSITING
-        # ----------------------------------------------------
-        if mode in (self.MODE_IMAGE, self.MODE_STUDIO, self.MODE_SOLID) and self.relighting_engine.enabled:
-            return self.relighting_engine.integrate(fg_frame, bg, mask_u8)
+        if self.hand_prior and hands:
+            s = pw / float(W)
+            boost = HandTracker.draw_mask((ph, pw), hands, scale=s, thickness=1.35)
+            if boost.any():
+                m = np.where(boost > 0, np.maximum(m, np.minimum(m * 3.0, 1.0)), m).astype(np.float32)
+                if hands_fresh:
+                    core = HandTracker.draw_mask((ph, pw), hands, scale=s, core_only=True)
+                    m = np.maximum(m, core.astype(np.float32) / 255.0)
+        hd_ = float(np.clip(self.hardness, 0.0, 1.0))
+        if hd_ > 0.01:
+            lo, hi = 0.15 * hd_, 1.0 - 0.3 * hd_
+            m = np.clip((m - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+        choke = int(self.edge_choke)
+        if choke != 0:
+            k = np.ones((abs(choke) * 2 + 1,) * 2, np.uint8)
+            m = cv2.erode(m, k) if choke < 0 else cv2.dilate(m, k)
 
-        # Fast SIMD C++ blend for blur or when relighting is disabled
-        m_3ch = cv2.merge([mask_u8, mask_u8, mask_u8])
-        inv_m = cv2.bitwise_not(m_3ch)
-        part_fg = cv2.multiply(fg_frame, m_3ch, scale=1.0/255.0)
-        part_bg = cv2.multiply(bg, inv_m, scale=1.0/255.0)
-        return cv2.add(part_fg, part_bg)
+        sw = self.SMALL_W
+        sh = max(8, int(round(sw * H / W)))
+        alpha_small = cv2.resize(m, (sw, sh), interpolation=cv2.INTER_AREA)
+        m_pre = m
+        removal = None
+        if self.isolator.enabled:
+            keep = self.isolator.update(alpha_small, head_n)
+            if keep is not None:
+                kp = cv2.resize(keep, (pw, ph), interpolation=cv2.INTER_LINEAR)
+                force = kp > 1.5
+                kk = np.clip(kp, 0.0, 1.0)
+                removal = np.where(force, 0.0, m * (1.0 - kk)).astype(np.float32)
+                m = np.where(force, 1.0, m * kk).astype(np.float32)
+                alpha_small = np.where(keep > 1.5, 1.0, alpha_small * np.clip(keep, 0.0, 1.0)).astype(np.float32)
+
+        a_full = self._upsample_alpha(m, frame_bgr)
+        alpha_full = (a_full * 255.0).astype(np.uint8) if want_alpha_full else None
+
+        if self.isolator.enabled:
+            self._update_plate_cpu(frame_bgr, m_pre)
+        src_clean = frame_bgr
+        if removal is not None:
+            r_full = cv2.resize(removal, (W, H), interpolation=cv2.INTER_LINEAR)
+            fill = self._fill_cpu(frame_bgr, m_pre)
+            src_clean = cv2.blendLinear(fill, frame_bgr, r_full, 1.0 - r_full)
+
+        if self.mode == self.MODE_ORIGINAL:
+            return BgResult(src_clean, alpha_small, alpha_full, engine="mediapipe")
+        if self.mode == self.MODE_BLUR:
+            sw_, sh_ = max(160, W // 4), max(90, H // 4)
+            small = cv2.resize(src_clean, (sw_, sh_), interpolation=cv2.INTER_AREA)
+            k = max(3, (int(self.blur_strength) // 2) | 1)
+            bg = cv2.resize(cv2.GaussianBlur(small, (k, k), 0), (W, H), interpolation=cv2.INTER_LINEAR)
+        else:
+            bg = self._cpu_plate(self.mode, H, W)
+            if bg is None:
+                return BgResult(frame_bgr, alpha_small, alpha_full, engine="mediapipe")
+        if self.relighting_engine.enabled and self.mode != self.MODE_BLUR:
+            comp = self.relighting_engine.integrate(src_clean, bg, (a_full * 255.0).astype(np.uint8))
+        else:
+            comp = cv2.blendLinear(src_clean, bg, a_full, 1.0 - a_full)
+        return BgResult(comp, alpha_small, alpha_full, engine="mediapipe")
+
+    def _upsample_alpha(self, m, frame_bgr):
+        H, W = frame_bgr.shape[:2]
+        if self.use_guided_filter and self._has_guided:
+            hw, hh = max(64, W // 2), max(36, H // 2)
+            guide = cv2.cvtColor(cv2.resize(frame_bgr, (hw, hh), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+            a = cv2.resize(m, (hw, hh), interpolation=cv2.INTER_LINEAR)
+            a = cv2.ximgproc.guidedFilter(guide=guide, src=a, radius=4, eps=2e-3 * 255 * 255)
+            return np.clip(cv2.resize(a, (W, H), interpolation=cv2.INTER_LINEAR), 0.0, 1.0)
+        return np.clip(cv2.resize(m, (W, H), interpolation=cv2.INTER_LINEAR), 0.0, 1.0)
+
+    def _update_plate_cpu(self, frame_bgr, m_small):
+        H, W = frame_bgr.shape[:2]
+        bgm = cv2.resize((cv2.dilate(m_small, np.ones((5, 5), np.uint8)) < 0.05).astype(np.uint8),
+                         (W, H), interpolation=cv2.INTER_NEAREST)
+        if self._plate_np is None or self._plate_np.shape[:2] != (H, W):
+            self._plate_np = frame_bgr.astype(np.float32)
+            self._plate_valid_np = bgm.copy()
+            return
+        cv2.accumulateWeighted(frame_bgr.astype(np.float32), self._plate_np, 0.08, mask=bgm)
+        self._plate_valid_np |= bgm
+
+    def _fill_cpu(self, frame_bgr, m_small):
+        H, W = frame_bgr.shape[:2]
+        sw, sh = max(8, W // 16), max(8, H // 16)
+        wgt = 1.0 - cv2.resize(cv2.dilate(m_small, np.ones((5, 5), np.uint8)), (sw, sh), interpolation=cv2.INTER_AREA)
+        small = cv2.resize(frame_bgr, (sw, sh), interpolation=cv2.INTER_AREA).astype(np.float32)
+        num = cv2.blur(small * wgt[:, :, None], (5, 5))
+        den = cv2.blur(wgt, (5, 5))[:, :, None]
+        fill = cv2.resize(np.clip(num / np.maximum(den, 1e-3), 0, 255).astype(np.uint8), (W, H), interpolation=cv2.INTER_LINEAR)
+        if self._plate_np is not None and self._plate_np.shape[:2] == (H, W):
+            valid = self._plate_valid_np.astype(bool)
+            fill[valid] = self._plate_np[valid].astype(np.uint8)
+        return fill
+
+    def _cpu_plate(self, mode, H, W):
+        key = (mode, H, W, self.solid_color if mode == self.MODE_SOLID else None)
+        cached = self._cpu_cache.get(mode)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        if mode == self.MODE_STUDIO:
+            y = np.linspace(0.0, 1.0, H, dtype=np.float32)[:, None]
+            x = np.linspace(-1.0, 1.0, W, dtype=np.float32)[None, :]
+            glow = np.exp(-((x * 0.9) ** 2 + ((y - 0.35) * 1.6) ** 2) * 1.8)
+            top = np.array([62, 46, 38], np.float32)       # BGR: cool slate
+            bot = np.array([22, 18, 16], np.float32)
+            base = top[None, None, :] * (1.0 - y[..., None]) + bot[None, None, :] * y[..., None]
+            plate = np.clip(base * (0.55 + 0.75 * glow[..., None]), 0, 255).astype(np.uint8)
+        elif mode == self.MODE_SOLID:
+            plate = np.empty((H, W, 3), np.uint8)
+            plate[:] = self.solid_color
+        elif mode == self.MODE_IMAGE:
+            if self.custom_bg_img is None:
+                return None
+            bh, bw = self.custom_bg_img.shape[:2]
+            s = max(W / bw, H / bh)
+            nw, nh = int(np.ceil(bw * s)), int(np.ceil(bh * s))
+            r = cv2.resize(self.custom_bg_img, (nw, nh), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+            x0, y0 = (nw - W) // 2, (nh - H) // 2
+            plate = np.ascontiguousarray(r[y0:y0 + H, x0:x0 + W])
+        else:
+            return None
+        self._cpu_cache[mode] = (key, plate)
+        return plate
 
     def close(self):
-        if hasattr(self, 'hand_landmarker') and self.hand_landmarker:
-            try:
-                self.hand_landmarker.close()
-            except Exception:
-                pass
-        if hasattr(self, 'segmenter') and self.segmenter:
+        if self.segmenter is not None:
             try:
                 self.segmenter.close()
             except Exception:
                 pass
-        self.rvm_model = None
-        self.rvm_rec = [None, None, None, None]
+        self._pool.shutdown(wait=False)
+        self.rvm.model = None
         if HAS_TORCH and torch.cuda.is_available():
             torch.cuda.empty_cache()

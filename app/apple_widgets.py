@@ -348,7 +348,11 @@ class AppleRow(QWidget):
         self.sub_label = None
         if subtitle:
             self.sub_label = QLabel(subtitle)
+            # Wrap instead of forcing the whole sidebar wider than its viewport.
+            self.sub_label.setWordWrap(True)
             text_layout.addWidget(self.sub_label)
+        text_container.setMinimumWidth(0)
+        text_container.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         layout.addWidget(text_container, stretch=1)
         layout.addWidget(widget, stretch=0, alignment=Qt.AlignRight | Qt.AlignVCenter)

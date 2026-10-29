@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from torchvision.models.mobilenetv3 import MobileNetV3, InvertedResidualConfig
-from torchvision.transforms.functional import normalize
+
 
 class MobileNetV3LargeEncoder(MobileNetV3):
     def __init__(self, pretrained: bool = False):
@@ -32,10 +32,17 @@ class MobileNetV3LargeEncoder(MobileNetV3):
 
         del self.avgpool
         del self.classifier
-        
+
+        # ImageNet normalization constants as (non-persistent) buffers instead of
+        # torchvision's normalize(), which builds its mean/std tensors from Python
+        # lists on every call — a host->device copy that is illegal inside CUDA
+        # Graph capture and adds per-frame launch overhead.
+        self.register_buffer('_norm_mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer('_norm_std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1), persistent=False)
+
     def forward_single_frame(self, x):
-        x = normalize(x, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-        
+        x = (x - self._norm_mean) / self._norm_std
+
         x = self.features[0](x)
         x = self.features[1](x)
         f1 = x

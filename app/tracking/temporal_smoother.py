@@ -58,6 +58,55 @@ class OneEuroFilter:
         self.t_prev = None
 
 
+class PoseFilter:
+    """
+    Low-lag 6DoF head pose smoother.
+
+    Tuned for privacy rather than cinematic smoothness: the helmet is drawn on the
+    very frame it was tracked on, so any smoothing lag lets the real face slide out
+    from under the helmet during fast moves. The 1-Euro filters therefore open up
+    aggressively with speed (high beta) and only smooth hard when the head is still,
+    which is where jitter is actually visible.
+    """
+    def __init__(self, rot_min_cutoff=1.5, rot_beta=3.0, trans_min_cutoff=1.5, trans_beta=0.3):
+        self.rot_filter = OneEuroFilter(min_cutoff=rot_min_cutoff, beta=rot_beta, d_cutoff=1.5)
+        self.trans_filter = OneEuroFilter(min_cutoff=trans_min_cutoff, beta=trans_beta, d_cutoff=1.5)
+        self.rot = None
+        self.trans = None
+
+    def update(self, rotvec, trans, t):
+        rotvec = np.asarray(rotvec, dtype=np.float64).reshape(3)
+        trans = np.asarray(trans, dtype=np.float64).reshape(3)
+        # Keep the rotation vector on the same "branch" as the filter state so a
+        # representation flip near |angle|=pi can never make the filter swing through
+        # a huge fake rotation.
+        if self.rot is not None:
+            ang = np.linalg.norm(rotvec)
+            if ang > 1e-6 and np.dot(rotvec, self.rot) < 0 and ang > np.pi * 0.5:
+                rotvec = rotvec / ang * (ang - 2.0 * np.pi)
+        self.rot = self.rot_filter.filter(rotvec, t)
+        self.trans = self.trans_filter.filter(trans, t)
+        return self.rot.copy(), self.trans.copy()
+
+    def force(self, rotvec, trans, t):
+        """Moves the filter state without smoothing (used while holding / following)."""
+        self.rot = np.asarray(rotvec, dtype=np.float64).reshape(3).copy()
+        self.trans = np.asarray(trans, dtype=np.float64).reshape(3).copy()
+        for f, x in ((self.rot_filter, self.rot), (self.trans_filter, self.trans)):
+            if f.t_prev is None:
+                f.filter(x, t)
+            else:
+                f.x_prev = x.copy()
+                f.dx_prev = np.zeros_like(x)
+                f.t_prev = t
+
+    def reset(self):
+        self.rot_filter.reset()
+        self.trans_filter.reset()
+        self.rot = None
+        self.trans = None
+
+
 class KinematicHeadPoseTracker:
     """
     Persistent 3D Head Space tracker featuring:

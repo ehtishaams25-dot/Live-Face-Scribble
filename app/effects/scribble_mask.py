@@ -1,24 +1,25 @@
 import cv2
 import numpy as np
 
-from app.effects.scribble_sphere_3d import ScribbleSphere3DEngine
-from app.effects.hand_drawn_expressions import HandDrawnExpressionsRenderer
+from app.effects.scribble_sphere_3d import ScribbleSphere3DEngine, resolve_style
+from app.effects.face_features import FaceFeatureRenderer
+from app.tracking.hand_tracker import HandTracker
 
 
 class ScribbleMaskEngine:
     """
-    Surreal 3D Multi-Shape Scribble Helmet Engine with Real-Time Expression Mimicry
-    and Foreground Hand Occlusion Awareness:
-    - 5 Predetermined Shapes: Head, Cube, Star, Diamond, Pill.
-    - Reuses the single shared hand occlusion mask computed once per frame by
-      BackgroundEngine (avoids loading/running a second redundant HandLandmarker).
-    - Strict Layered Compositing: Camera Hand -> Foreground Overlay -> Zero Scribble Leak.
-    - Responsive slider control over density, thickness, 3D scale, and X/Y/Z offsets.
-    """
+    Composes the full scribble head for one frame:
+        privacy core -> solid shaded 3D helmet -> scribble strokes -> outline
+        -> landmark-driven face -> hands raised in front of the face on top.
 
-    STYLE_WHITE = ScribbleSphere3DEngine.STYLE_WHITE
-    STYLE_DARK = ScribbleSphere3DEngine.STYLE_DARK
-    STYLE_CYBER = ScribbleSphere3DEngine.STYLE_CYBER
+    Privacy rules enforced here:
+      * The helmet body is opaque by default and its silhouette is the exact projected
+        solid (see ScribbleSphere3DEngine), unioned with the *current* face-landmark hull
+        grown by `core_margin`, so a pose that lags a fast move by a frame still covers
+        the real face.
+      * Hands are drawn over the helmet only from this frame's hand landmarks, using
+        masks shrunk inside the fingers — never from stale or loose masks.
+    """
 
     SHAPE_HEAD = ScribbleSphere3DEngine.SHAPE_HEAD
     SHAPE_CUBE = ScribbleSphere3DEngine.SHAPE_CUBE
@@ -28,45 +29,28 @@ class ScribbleMaskEngine:
 
     def __init__(self, texture_path: str = None, boil_fps: float = 12.0, radius_cm: float = 14.5):
         self.boil_fps = float(boil_fps)
-        self.base_rx = 14.5
-        self.base_ry = 18.5
-        self.base_rz = 15.5
-        self.style = self.STYLE_WHITE
-        self.cavity_darkness = 0.85
+        self.style = "ink"
         self.line_width = 3
         self.density = 90
-        self.offset_x = 0.0
-        self.offset_y = 1.0
-        self.offset_z = -0.5
-        self.sketch_noise = 0.85
-
-        # Core 3D Multi-Shape Scribble Helmet Engine
+        self.offset_x, self.offset_y, self.offset_z = 0.0, 1.5, -0.5
+        self.privacy_core = True
+        self.core_margin = 0.18
+        self.hands_over_helmet = True
+        self.uncertain_growth = 1.12
+        self._boost = 1.0
         self.sphere_3d = ScribbleSphere3DEngine(
-            semi_width_x=self.base_rx,
-            semi_height_y=self.base_ry,
-            semi_depth_z=self.base_rz,
-            center_offset_x=self.offset_x,
-            center_offset_y=self.offset_y,
-            center_offset_z=self.offset_z,
-            line_thickness=self.line_width,
-            density=self.density,
-            cavity_darkness=self.cavity_darkness,
-            shape=self.SHAPE_HEAD
-        )
+            semi_width_x=14.5, semi_height_y=18.5, semi_depth_z=15.5,
+            center_offset_x=self.offset_x, center_offset_y=self.offset_y, center_offset_z=self.offset_z,
+            line_thickness=self.line_width, density=self.density)
+        self.expressions_engine = FaceFeatureRenderer(boil_fps=self.boil_fps)
+        self.features = self.expressions_engine
 
-        # Real-Time Hand-Drawn Expression Mimicry Engine
-        self.expressions_engine = HandDrawnExpressionsRenderer(boil_fps=self.boil_fps)
-
+    # -- settings passthroughs --------------------------------------------------------
     def set_shape(self, shape_name: str):
         self.sphere_3d.set_shape(shape_name)
 
     def set_style(self, style: str):
-        if style in (self.STYLE_WHITE, self.STYLE_DARK, self.STYLE_CYBER):
-            self.style = style
-
-    def set_cavity_darkness(self, darkness: float):
-        self.cavity_darkness = float(np.clip(darkness, 0.0, 1.0))
-        self.sphere_3d.set_cavity_darkness(self.cavity_darkness)
+        self.style = resolve_style(style)
 
     def set_density(self, density: int):
         self.density = int(density)
@@ -79,7 +63,7 @@ class ScribbleMaskEngine:
     def set_scale(self, scale_ratio: float):
         self.sphere_3d.set_scale(scale_ratio)
 
-    def set_offsets(self, offset_x: float = None, offset_y: float = None, offset_z: float = None):
+    def set_offsets(self, offset_x=None, offset_y=None, offset_z=None):
         if offset_x is not None:
             self.offset_x = float(offset_x)
         if offset_y is not None:
@@ -94,66 +78,67 @@ class ScribbleMaskEngine:
     def set_tongue_sensitivity(self, sensitivity: str):
         self.expressions_engine.set_tongue_sensitivity(sensitivity)
 
-    def apply(self, frame_bgr: np.ndarray, tracking_data: dict,
-              size_scale: float = 1.45,
-              parallax_gain: float = 1.6,
-              obscuration_strength: float = 0.0,
-              enable_boil: bool = True,
-              style: str = None,
-              cavity_darkness: float = None,
-              t_sec: float = None,
-              sketch_fps: float = None,
-              sketch_noise: float = None,
-              enable_expressions: bool = True,
-              clean_camera_frame: np.ndarray = None,
-              timestamp_ms: int = None,
-              hand_mask: np.ndarray = None) -> np.ndarray:
+    # -- render ----------------------------------------------------------------------
+    def _privacy_hull(self, tracking_data):
+        lm = tracking_data.get('landmarks_2d')
+        if not self.privacy_core or lm is None or len(lm) < 10:
+            return None
+        hull = cv2.convexHull(lm.astype(np.float32)).reshape(-1, 2)
+        c = hull.mean(axis=0)
+        return (hull - c) * (1.0 + self.core_margin) + c
+
+    def apply(self, frame_bgr: np.ndarray, tracking_data: dict, size_scale: float = 1.45,
+              parallax_gain: float = 1.6, obscuration_strength: float = 1.0, enable_boil: bool = True,
+              style: str = None, cavity_darkness: float = None, t_sec: float = None, sketch_fps: float = None,
+              sketch_noise: float = None, enable_expressions: bool = True, clean_camera_frame: np.ndarray = None,
+              timestamp_ms: int = None, hand_mask: np.ndarray = None, hands=None, hands_fresh: bool = False) -> np.ndarray:
         if not tracking_data.get('has_face', False):
             return frame_bgr
+        active_style = resolve_style(style if style is not None else self.style)
+        fps = sketch_fps if sketch_fps is not None else self.boil_fps
+        noise = 0.85 if sketch_noise is None else sketch_noise
+        # Uncertain pose (holding through a tracking dropout) -> grow the helmet a little
+        # as a safety margin; eased so the size never visibly pops.
+        target = 1.0 if tracking_data.get('face_fresh', True) else self.uncertain_growth
+        self._boost += (target - self._boost) * 0.3
+        self.sphere_3d.set_scale((size_scale / 1.45 if size_scale > 0.1 else 1.0) * self._boost)
+        self.sphere_3d.core_scale = self._boost
 
-        active_style = style if style is not None else self.style
-        active_cavity = cavity_darkness if cavity_darkness is not None else self.cavity_darkness
-        active_fps = sketch_fps if sketch_fps is not None else self.boil_fps
-        active_noise = sketch_noise if sketch_noise is not None else self.sketch_noise
+        # Hands in front of the face: remember the clean pixels before we paint.
+        occluders = hands if (self.hands_over_helmet and hands_fresh and hands) else None
+        clean = None
+        if occluders is not None:
+            clean = clean_camera_frame if clean_camera_frame is not None and clean_camera_frame is not frame_bgr else frame_bgr.copy()
 
-        # Dynamic scale adjustment
-        self.sphere_3d.set_scale(size_scale / 1.45 if size_scale > 0.1 else 1.0)
+        self.sphere_3d.apply(
+            frame_bgr=frame_bgr, tracking_data=tracking_data, t_sec=t_sec, style=active_style,
+            line_width=self.line_width, enable_boil=enable_boil, sketch_fps=fps, sketch_noise=noise,
+            privacy_hull=self._privacy_hull(tracking_data))
 
-        # Clean copy of the current source/composited frame before the scribble helmet is added.
-        clean_composite = clean_camera_frame if clean_camera_frame is not None else frame_bgr.copy()
+        if enable_expressions and self.sphere_3d.last_sil_bbox is not None:
+            H = frame_bgr.shape[0]
+            px_scale = max(1.0, min(frame_bgr.shape[:2]) / 720.0)
+            self.expressions_engine.render(frame_bgr, tracking_data, self.sphere_3d, style=active_style,
+                                           t_sec=t_sec, line_px=max(1, int(round(self.line_width * px_scale))))
 
-        # 1. Hand Foreground Mask for Occlusion — supplied by BackgroundEngine
-        #    (the single shared HandLandmarker instance for the whole pipeline).
+        if occluders is not None and self.sphere_3d.last_sil_bbox is not None:
+            self._composite_hands(frame_bgr, clean, occluders)
+        return frame_bgr
 
-        # 2. Render 3D Scribble Helmet
-        out_frame = self.sphere_3d.apply(
-            frame_bgr=frame_bgr,
-            tracking_data=tracking_data,
-            t_sec=t_sec,
-            style=active_style,
-            cavity_darkness=active_cavity,
-            line_width=self.line_width,
-            enable_boil=enable_boil,
-            sketch_fps=active_fps,
-            sketch_noise=active_noise,
-            hand_mask=hand_mask
-        )
-
-        # 3. Render Hand-Drawn Animated Facial Expression Mimicry
-        if enable_expressions:
-            out_frame = self.expressions_engine.render(
-                frame_bgr=out_frame,
-                tracking_data=tracking_data,
-                style=active_style,
-                t_sec=t_sec,
-                line_thickness=max(2, self.line_width)
-            )
-
-        # 4. Strict Foreground Hand Compositing
-        # Guarantees that hands placed in front of the face/mouth ALWAYS stay on top
-        # of BOTH the scribble helmet and the facial expressions, WITHOUT leaking real room background!
-        if hand_mask is not None and np.any(hand_mask > 20):
-            alpha_hand = (hand_mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
-            out_frame[:] = (clean_composite * alpha_hand + out_frame * (1.0 - alpha_hand)).astype(np.uint8)
-
-        return out_frame
+    def _composite_hands(self, frame, clean, hands):
+        x0, y0, x1, y1 = self.sphere_3d.last_sil_bbox
+        hb = HandTracker.bbox(hands, pad=0.3)
+        if hb is None:
+            return
+        # Only the overlap between hands and helmet needs work.
+        ox0, oy0 = max(x0, hb[0]), max(y0, hb[1])
+        ox1, oy1 = min(x1, hb[2]), min(y1, hb[3])
+        if ox1 - ox0 < 2 or oy1 - oy0 < 2:
+            return
+        m = HandTracker.draw_mask((oy1 - oy0, ox1 - ox0), hands, offset=(ox0, oy0), thickness=0.85)
+        if not m.any():
+            return
+        m = cv2.erode(m, np.ones((3, 3), np.uint8))
+        a = cv2.GaussianBlur(m, (3, 3), 0).astype(np.float32) / 255.0
+        roi = frame[oy0:oy1, ox0:ox1]
+        roi[:] = cv2.blendLinear(clean[oy0:oy1, ox0:ox1], roi, a, 1.0 - a)
