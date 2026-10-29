@@ -18,13 +18,17 @@ def main():
     multiprocessing.freeze_support()
     os.environ.setdefault("GLOG_minloglevel", "2")       # quieter MediaPipe logs
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    print("[Launcher] Initializing UI and runtime libraries...")
     from PySide6.QtWidgets import QApplication
     from app.ui_window import ScribbleCameraWindow
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationName("Scribble Studio")
+
+    print("[Launcher] Loading AI models, tracking pipelines & GPU matting engines (~10-15s)...")
     window = ScribbleCameraWindow()
+    print("[Launcher] Models loaded successfully! Launching window...")
     window.show()
     sys.exit(app.exec())
 
